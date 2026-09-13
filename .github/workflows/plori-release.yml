@@ -1,0 +1,50 @@
+# Plori fork release: build runsc and the containerd shim with plain Go from this
+# synthetic go branch and publish them in the layout plori-runtime's installers
+# expect. No bazel, no Docker build container, no apt repository, x86_64 only.
+name: plori-release
+
+on:
+  push:
+    tags:
+      - "release-*-plori.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p out/gvisor-bin
+          go build -trimpath -ldflags "-s -w -X gvisor.dev/gvisor/runsc/version.version=${tag}" -o out/runsc ./runsc
+          go build -trimpath -ldflags "-s -w" -o out/containerd-shim-runsc-v1 ./shim
+          got="$(out/runsc --version | head -n1)"
+          [ "$got" = "runsc version ${tag}" ] || { echo "version stamp mismatch: $got" >&2; exit 1; }
+          # Same layout as the upstream tarball: two binaries at the top level and a
+          # gvisor-bin/ directory (upstream ships checkpointgofer and runsc-metric-server
+          # there; nothing in plori-runtime uses them, so the directory is empty here).
+          touch out/gvisor-bin/.keep
+          tar -C out -cjf gvisor.tar.bz2 runsc containerd-shim-runsc-v1 gvisor-bin
+          sha512sum gvisor.tar.bz2 > gvisor.tar.bz2.sha512
+          cat gvisor.tar.bz2.sha512
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" gvisor.tar.bz2 gvisor.tar.bz2.sha512 \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "runsc and containerd-shim-runsc-v1 (linux/amd64) built with plain Go from ${GITHUB_SHA}. Layout matches the upstream gvisor.tar.bz2; gvisor-bin/ is intentionally empty."
