@@ -1461,11 +1461,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if opts.Flags&(linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE) == linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE {
 		return linuxerr.EINVAL
 	}
-	if fs.opts.interop == InteropModeShared && opts.Flags&linux.RENAME_NOREPLACE != 0 {
-		// Requires 9P support to synchronize with other remote filesystem
-		// users.
-		return linuxerr.EINVAL
-	}
+	// For nonzero flags, ClientFD.RenameAt uses the atomic RenameAt2 RPC and
+	// returns EINVAL when the peer does not advertise that operation. Shared
+	// revalidation cannot close an external create race; the atomic backend
+	// operation below does.
 	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
 	newName := rp.Component()
