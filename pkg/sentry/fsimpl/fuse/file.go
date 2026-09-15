@@ -170,11 +170,6 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 	inode := fd.inode()
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
-	fs := inode.fs
-	// no need to proceed if FUSE server doesn't implement Open.
-	if fs.conn.noOpen {
-		return linuxerr.EINVAL
-	}
 
 	var syncFlags uint32
 	if opts.DataOnly {
@@ -185,10 +180,18 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 		Fh:         fd.Fh,
 		FsyncFlags: syncFlags,
 	}
-	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
-	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)
-	// The reply will be ignored since no callback is defined in asyncCallBack().
-	fs.conn.CallAsync(ctx, req)
+	opcode := linux.FUSE_FSYNC
+	if inode.filemode().IsDir() {
+		opcode = linux.FUSE_FSYNCDIR
+	}
+	req := inode.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
+	res, err := inode.fs.conn.Call(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := res.Error(); err != nil && !linuxerr.Equals(linuxerr.ENOSYS, err) {
+		return err
+	}
 	return nil
 }
 
