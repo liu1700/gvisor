@@ -180,7 +180,7 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 		Fh:         fd.Fh,
 		FsyncFlags: syncFlags,
 	}
-	opcode := linux.FUSE_FSYNC
+	var opcode linux.FUSEOpcode = linux.FUSE_FSYNC
 	if inode.filemode().IsDir() {
 		opcode = linux.FUSE_FSYNCDIR
 	}
