@@ -19,7 +19,7 @@ done
 [[ -x "$runsc" && -f "$rootfs_tar" && -n "$output" ]] || usage
 case "$selected" in diagnostic|mmap|git|control|all) ;; *) usage ;; esac
 
-base=${FUSE_TEST_TMPDIR:-/tmp/gvisor-fuse-tests}
+base=${FUSE_TEST_TMPDIR:-/tmp/gvisor-fuse-runs}
 mkdir -p "$base" "$(dirname "$output")"
 run_dir=$(mktemp -d "$base/run.XXXXXX")
 bundle=$run_dir/bundle
@@ -37,6 +37,7 @@ fi
 
 cleanup() {
   local rc=$?
+  local safe_to_remove=1 null_netns="$state/null-netns" owned_mounts
   timeout 15s "${elevate[@]}" "$runsc" --root="$state" delete --force "$container_id" >/dev/null 2>&1 || true
   local i residue=0
   for ((i=0; i<50; i++)); do
@@ -51,7 +52,19 @@ cleanup() {
     echo "runsc process remains for private root: $state" >&2
     rc=1
   fi
-  if ((rc == 0)) || [[ ${FUSE_TEST_PRESERVE_FAILURE:-0} != 1 ]]; then
+  if findmnt -rn --mountpoint "$null_netns" >/dev/null 2>&1; then
+    if ! "${elevate[@]}" umount -- "$null_netns"; then
+      echo "failed to unmount private runsc network namespace: $null_netns" >&2
+      rc=1
+    fi
+  fi
+  owned_mounts=$(findmnt -rn -o TARGET | awk -v root="$state" '$0 == root || index($0, root "/") == 1')
+  if [[ -n "$owned_mounts" ]]; then
+    echo "mount remains under private runsc root: $owned_mounts" >&2
+    rc=1
+    safe_to_remove=0
+  fi
+  if ((safe_to_remove)) && { ((rc == 0)) || [[ ${FUSE_TEST_PRESERVE_FAILURE:-0} != 1 ]]; }; then
     "${elevate[@]}" rm -rf -- "$run_dir"
   else
     echo "preserved_failed_run=$run_dir" >&2
