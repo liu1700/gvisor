@@ -3,7 +3,23 @@
 set -euo pipefail
 
 tag=${1:?usage: tools/plori-release-build.sh RELEASE_TAG}
-out=${2:-out}
+out_arg=${2:-out}
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! git diff --quiet HEAD -- || test -n "$(git ls-files --others --exclude-standard)"; then
+  echo "release build requires a clean source checkout" >&2
+  exit 1
+fi
+
+case "$out_arg" in
+  ''|.|/)
+    echo "output directory must name a directory below or outside the source root" >&2
+    exit 1
+    ;;
+  /*) out=$out_arg ;;
+  *) out="$root/$out_arg" ;;
+esac
 src="$out/.plori-release-src"
 trap 'rm -rf "$src"' EXIT
 
