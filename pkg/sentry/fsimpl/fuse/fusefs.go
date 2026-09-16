@@ -28,7 +28,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -85,6 +87,11 @@ type filesystemOptions struct {
 //
 // +stateify savable
 type filesystem struct {
+	// Weak inode index: hard links and repeated lookups share mappings and locks.
+	inodesMu sync.Mutex `state:"nosave"`
+	inodes   map[uint64]*inode
+
+	mf *pgalloc.MemoryFile `state:"nosave"`
 	kernfs.Filesystem
 	devMinor uint32
 
@@ -214,6 +221,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 	conn.fuseConn = hostConn
 
 	fs := &filesystem{
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 		devMinor: devMinor,
 		opts:     fsopts,
 		conn:     conn,
@@ -355,6 +363,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 	}
 
 	fs := &filesystem{
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 		devMinor: devMinor,
 		opts:     opts,
 		conn:     fuseFD.conn,
@@ -366,9 +375,9 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.Filesystem.Release(ctx)
 	fs.conn.fuseConn.release(ctx)
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
-	fs.Filesystem.Release(ctx)
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
@@ -394,17 +403,27 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (ker
 	if !isValidType(attr.Mode) {
 		return nil, linuxerr.EIO
 	}
+	fs.inodesMu.Lock()
+	if old := fs.inodes[out.NodeID]; old != nil && old.generation == out.Generation && old.TryIncRef() {
+		fs.inodesMu.Unlock()
+		return old, nil
+	}
+	defer fs.inodesMu.Unlock()
 	i := &inode{fs: fs, nodeID: out.NodeID, generation: out.Generation}
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
 
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
 	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
-	i.updateAttrs(attr, int64(out.AttrValid), int64(out.AttrValidNSec))
+	i.updateAttrs(ctx, attr, int64(out.AttrValid), int64(out.AttrValidNSec))
 	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
 
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
+	if fs.inodes == nil {
+		fs.inodes = make(map[uint64]*inode)
+	}
+	fs.inodes[out.NodeID] = i
 	return i, nil
 }
 
@@ -416,4 +435,34 @@ func isValidType(mode uint32) bool {
 	default:
 		return false
 	}
+}
+
+// Sync flushes sentry-owned mapped data before requesting daemon durability.
+func (fs *filesystem) Sync(ctx context.Context) error {
+	fs.inodesMu.Lock()
+	var inodes []*inode
+	for _, i := range fs.inodes {
+		if i.TryIncRef() {
+			inodes = append(inodes, i)
+		}
+	}
+	fs.inodesMu.Unlock()
+	var firstErr error
+	for _, i := range inodes {
+		i.dataMu.Lock()
+		err := i.syncMappedLocked(ctx)
+		if err == nil && i.writebackFD != nil {
+			in := linux.FUSEFsyncIn{Fh: i.writebackFD.Fh}
+			err = i.call(ctx, linux.FUSE_FSYNC, &in, nil)
+			if linuxerr.Equals(linuxerr.ENOSYS, err) {
+				err = nil
+			}
+		}
+		i.dataMu.Unlock()
+		i.DecRef(ctx)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

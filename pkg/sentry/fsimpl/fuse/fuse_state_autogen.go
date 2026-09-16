@@ -352,6 +352,7 @@ func (fs *filesystem) StateTypeName() string {
 
 func (fs *filesystem) StateFields() []string {
 	return []string{
+		"inodes",
 		"Filesystem",
 		"devMinor",
 		"conn",
@@ -365,22 +366,23 @@ func (fs *filesystem) beforeSave() {}
 // +checklocksignore
 func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	fs.beforeSave()
-	stateSinkObject.Save(0, &fs.Filesystem)
-	stateSinkObject.Save(1, &fs.devMinor)
-	stateSinkObject.Save(2, &fs.conn)
-	stateSinkObject.Save(3, &fs.opts)
-	stateSinkObject.Save(4, &fs.clock)
+	stateSinkObject.Save(0, &fs.inodes)
+	stateSinkObject.Save(1, &fs.Filesystem)
+	stateSinkObject.Save(2, &fs.devMinor)
+	stateSinkObject.Save(3, &fs.conn)
+	stateSinkObject.Save(4, &fs.opts)
+	stateSinkObject.Save(5, &fs.clock)
 }
-
-func (fs *filesystem) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &fs.Filesystem)
-	stateSourceObject.Load(1, &fs.devMinor)
-	stateSourceObject.Load(2, &fs.conn)
-	stateSourceObject.Load(3, &fs.opts)
-	stateSourceObject.Load(4, &fs.clock)
+	stateSourceObject.Load(0, &fs.inodes)
+	stateSourceObject.Load(1, &fs.Filesystem)
+	stateSourceObject.Load(2, &fs.devMinor)
+	stateSourceObject.Load(3, &fs.conn)
+	stateSourceObject.Load(4, &fs.opts)
+	stateSourceObject.Load(5, &fs.clock)
+	stateSourceObject.AfterLoad(func() { fs.afterLoad(ctx) })
 }
 
 func (f *fileHandle) StateTypeName() string {
@@ -446,6 +448,10 @@ func (i *inode) StateFields() []string {
 		"size",
 		"nlink",
 		"blockSize",
+		"mappings",
+		"cache",
+		"dirty",
+		"writebackFD",
 	}
 }
 
@@ -480,6 +486,10 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(23, &i.size)
 	stateSinkObject.Save(24, &i.nlink)
 	stateSinkObject.Save(25, &i.blockSize)
+	stateSinkObject.Save(26, &i.mappings)
+	stateSinkObject.Save(27, &i.cache)
+	stateSinkObject.Save(28, &i.dirty)
+	stateSinkObject.Save(29, &i.writebackFD)
 }
 
 func (i *inode) afterLoad(context.Context) {}
@@ -512,6 +522,10 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(23, &i.size)
 	stateSourceObject.Load(24, &i.nlink)
 	stateSourceObject.Load(25, &i.blockSize)
+	stateSourceObject.Load(26, &i.mappings)
+	stateSourceObject.Load(27, &i.cache)
+	stateSourceObject.Load(28, &i.dirty)
+	stateSourceObject.Load(29, &i.writebackFD)
 }
 
 func (r *inodeRefs) StateTypeName() string {
@@ -546,8 +560,8 @@ func (fd *regularFileFD) StateFields() []string {
 	return []string{
 		"fileDescription",
 		"off",
-		"mappings",
-		"data",
+		"handleTransferred",
+		"released",
 	}
 }
 
@@ -558,8 +572,8 @@ func (fd *regularFileFD) StateSave(stateSinkObject state.Sink) {
 	fd.beforeSave()
 	stateSinkObject.Save(0, &fd.fileDescription)
 	stateSinkObject.Save(1, &fd.off)
-	stateSinkObject.Save(2, &fd.mappings)
-	stateSinkObject.Save(3, &fd.data)
+	stateSinkObject.Save(2, &fd.handleTransferred)
+	stateSinkObject.Save(3, &fd.released)
 }
 
 func (fd *regularFileFD) afterLoad(context.Context) {}
@@ -568,8 +582,8 @@ func (fd *regularFileFD) afterLoad(context.Context) {}
 func (fd *regularFileFD) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fd.fileDescription)
 	stateSourceObject.Load(1, &fd.off)
-	stateSourceObject.Load(2, &fd.mappings)
-	stateSourceObject.Load(3, &fd.data)
+	stateSourceObject.Load(2, &fd.handleTransferred)
+	stateSourceObject.Load(3, &fd.released)
 }
 
 func (l *requestList) StateTypeName() string {
