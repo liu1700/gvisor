@@ -201,6 +201,27 @@ static int fake_protocol_case(const char *root) {
   printf("{\"case\":\"fake-daemon-io-errors\",\"ok\":%s,\"read_errno\":%d,\"write_errno\":%d}\n",
          io_error_ok ? "true" : "false", read_errno, write_errno);
 
+  snprintf(path, sizeof(path), "%s/cache-refresh", root);
+  int first = open(path, O_RDWR);
+  if (first < 0) return 47;
+  unsigned char *clean_view = mmap(NULL, 4096, PROT_READ, MAP_SHARED, first, 0);
+  unsigned char *dirty_view = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, first, 4096);
+  if (clean_view == MAP_FAILED || dirty_view == MAP_FAILED) return 47;
+  int old_ok = clean_view[0] == 'A' && dirty_view[100] == 'A';
+  dirty_view[100] = 'D';
+  int second = open(path, O_RDONLY);
+  if (second < 0) return 48;
+  unsigned char fresh = 0, dirty = 0;
+  ssize_t fresh_n = pread(second, &fresh, 1, 0);
+  if (msync(dirty_view, 4096, MS_SYNC) != 0) return 49;
+  ssize_t dirty_n = pread(first, &dirty, 1, 4096 + 100);
+  int cache_refresh_ok = old_ok && second >= 0 && fresh_n == 1 && fresh == 'B' &&
+                         clean_view[0] == 'B' && dirty_n == 1 && dirty == 'D' &&
+                         dirty_view[100] == 'D';
+  printf("{\"case\":\"fake-open-drops-clean-cache\",\"ok\":%s,\"fresh\":%u,\"mapped\":%u,\"dirty\":%u}\n",
+         cache_refresh_ok ? "true" : "false", fresh, clean_view[0], dirty);
+  munmap(clean_view, 4096); munmap(dirty_view, 4096); close(first); close(second);
+
   int direct_mmap_ok = 1;
   const char *direct_names[] = {"direct", "dynamic"};
   for (size_t i = 0; i < 2; ++i) {
@@ -220,7 +241,7 @@ static int fake_protocol_case(const char *root) {
     printf("{\"case\":\"fake-directio-mmap-%s\",\"ok\":%s,\"private_errno\":%d,\"shared_errno\":%d}\n",
            direct_names[i], one_ok ? "true" : "false", private_errno, shared_errno);
   }
-  return mmap_ok && dynamic_ok && direct_mmap_ok && write_ok && io_error_ok ? 0 : 45;
+  return mmap_ok && dynamic_ok && direct_mmap_ok && write_ok && io_error_ok && cache_refresh_ok ? 0 : 45;
 }
 
 static int disconnect_case(const char *root) {

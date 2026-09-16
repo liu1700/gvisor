@@ -24,6 +24,7 @@ enum {
   WRITE_STATS_INO,
   READ_EIO_INO,
   WRITE_EIO_INO,
+  CACHE_REFRESH_INO,
   DISCONNECT_INO,
 };
 
@@ -34,6 +35,8 @@ static volatile sig_atomic_t stop;
 static size_t written_total;
 static size_t written_max;
 static size_t zero_write_nonzero_offset;
+static unsigned char cache_refresh_data[8192];
+static unsigned int cache_refresh_opens;
 
 static void sleep_ms(int ms) {
   struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -67,6 +70,7 @@ static fuse_ino_t name_ino(const char *name) {
   if (strcmp(name, "write-stats") == 0) return WRITE_STATS_INO;
   if (strcmp(name, "read-eio") == 0) return READ_EIO_INO;
   if (strcmp(name, "write-eio") == 0) return WRITE_EIO_INO;
+  if (strcmp(name, "cache-refresh") == 0) return CACHE_REFRESH_INO;
   if (strcmp(name, "disconnect") == 0) return DISCONNECT_INO;
   return 0;
 }
@@ -100,6 +104,11 @@ static void op_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
   }
   fi->fh = ino;
   if (ino == DIRECT_INO || ino == DYNAMIC_INO) fi->direct_io = 1;
+  if (ino == CACHE_REFRESH_INO) {
+    cache_refresh_opens++;
+    if (cache_refresh_opens == 2) memset(cache_refresh_data, 'B', sizeof(cache_refresh_data));
+    fi->keep_cache = 0;
+  }
   fuse_reply_open(req, fi);
 }
 
@@ -131,6 +140,8 @@ static void op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     _exit(0);
   } else if (ino == DYNAMIC_INO) {
     reply_buf(req, dynamic_data, sizeof(dynamic_data) - 1, size, off);
+  } else if (ino == CACHE_REFRESH_INO) {
+    reply_buf(req, (const char *)cache_refresh_data, sizeof(cache_refresh_data), size, off);
   } else if (ino == WRITE_STATS_INO) {
     char stats[128];
     int n = snprintf(stats, sizeof(stats), "total=%zu max=%zu zero_nonzero=%zu\n",
@@ -146,6 +157,16 @@ static void op_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
   (void)buf; (void)off; (void)fi;
   if (ino == WRITE_EIO_INO) {
     fuse_reply_err(req, EIO);
+    return;
+  }
+  if (ino == CACHE_REFRESH_INO) {
+    if (off < 0 || (size_t)off > sizeof(cache_refresh_data) ||
+        size > sizeof(cache_refresh_data) - (size_t)off) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    memcpy(cache_refresh_data + off, buf, size);
+    fuse_reply_write(req, size);
     return;
   }
   written_total += size;
@@ -192,6 +213,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 3) delay_ms = atoi(argv[2]);
   if (delay_ms < 0) return 2;
+  memset(cache_refresh_data, 'A', sizeof(cache_refresh_data));
 
   const struct fuse_lowlevel_ops ops = {
     .lookup = op_lookup, .getattr = op_getattr, .open = op_open, .opendir = op_opendir,
