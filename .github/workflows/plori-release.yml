@@ -36,4 +36,4 @@ jobs:
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" gvisor.tar.bz2 gvisor.tar.bz2.sha512 \
             --title "${GITHUB_REF_NAME}" \
-            --notes "runsc, containerd-shim-runsc-v1, and the strict FUSE boot-path sidecars (linux/amd64) built from ${GITHUB_SHA}."
+            --notes "runsc, containerd-shim-runsc-v1, and all standard upstream sidecars (linux/amd64) built from ${GITHUB_SHA}."
