@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // consts used by FUSE_INIT negotiation.
@@ -184,16 +185,26 @@ func (conn *connection) initProcessReply(out *linux.FUSEInitOut, hasSysAdminCap 
 // It tries to acquire conn.fd.mu, conn.lock, conn.bgLock in order.
 // All possible requests waiting or blocking will be aborted.
 func (conn *connection) Abort(ctx context.Context) {
+	conn.abort(ctx, false /* alreadyDisconnected */)
+}
+
+// abort terminates pending work. alreadyDisconnected is used by final unmount,
+// which changes connected under conn.mu before releasing that lock so a new
+// mount cannot race into this connection.
+func (conn *connection) abort(ctx context.Context, alreadyDisconnected bool) {
 	conn.mu.Lock()
 	conn.asyncMu.Lock()
 
-	if !conn.connected {
+	if !conn.connected && !alreadyDisconnected {
 		conn.asyncMu.Unlock()
 		conn.mu.Unlock()
 		return
 	}
 
-	conn.connected = false
+	if conn.connected {
+		conn.connected = false
+	}
+	conn.waitQueue.Notify(waiter.ReadableEvents)
 
 	// Empty the `conn.queue` that holds the requests
 	// not yet read by the FUSE daemon yet.

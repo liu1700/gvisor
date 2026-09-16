@@ -168,8 +168,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // /dev/fuse DeviceFD.
 func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, kernelTask *kernel.Task, fuseFD *DeviceFD, devMinor uint32, fsopts *filesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	fuseFD.mu.Lock()
-	connected := fuseFD.connected()
-	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, fsopts)
+	fs, newConnection, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
 		fuseFD.mu.Unlock()
@@ -179,7 +178,7 @@ func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *
 
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
-	if !connected {
+	if newConnection {
 		if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
 			log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
 			return nil, nil, err
@@ -352,14 +351,30 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 
 // newFUSEFilesystem creates a new FUSE filesystem.
 // +checklocks:fuseFD.mu
-func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
-	if !fuseFD.connected() {
-		conn, err := newFUSEConnection(ctx, fuseFD, opts)
-		if err != nil {
-			log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
-			return nil, linuxerr.EINVAL
+func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, bool, error) {
+	newConnection := false
+	for {
+		if !fuseFD.connected() {
+			oldConn := fuseFD.conn
+			conn, err := newFUSEConnection(ctx, fuseFD, opts)
+			if err != nil {
+				log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
+				return nil, false, linuxerr.EINVAL
+			}
+			fuseFD.conn = conn
+			newConnection = true
+			// Transfer this DeviceFD's reference from a disconnected connection.
+			// Cloned device FDs retain their own references and are unaffected.
+			if oldConn != nil {
+				oldConn.DecRef(ctx)
+			}
 		}
-		fuseFD.conn = conn
+
+		if dc, ok := fuseFD.conn.fuseConn.(*deviceConn); !ok || dc.addMount() {
+			break
+		}
+		// Last unmount disconnected the connection between connected() and
+		// addMount(). Retry and create a new connection under fuseFD.mu.
 	}
 
 	fs := &filesystem{
@@ -370,7 +385,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 		clock:    ktime.RealtimeClockFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
-	return fs, nil
+	return fs, newConnection, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
