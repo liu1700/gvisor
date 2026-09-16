@@ -76,7 +76,7 @@ func (fd *regularFileFD) mmapTranslate(ctx context.Context, required, optional m
 	i := fd.inode()
 	mf := i.fs.mf
 	if mf == nil {
-		return nil, &memmap.BusError{linuxerr.ENODEV}
+		return nil, &memmap.BusError{Err: linuxerr.ENODEV}
 	}
 	i.dataMu.Lock()
 	defer i.dataMu.Unlock()
@@ -87,7 +87,7 @@ func (fd *regularFileFD) mmapTranslate(ctx context.Context, required, optional m
 	beyond := false
 	if required.End > pgend {
 		if required.Start >= pgend {
-			return nil, &memmap.BusError{io.EOF}
+			return nil, &memmap.BusError{Err: io.EOF}
 		}
 		required.End = pgend
 		beyond = true
@@ -111,10 +111,10 @@ func (fd *regularFileFD) mmapTranslate(ctx context.Context, required, optional m
 		end = r.End
 	}
 	if end < required.End && fillErr != nil {
-		return out, &memmap.BusError{fillErr}
+		return out, &memmap.BusError{Err: fillErr}
 	}
 	if beyond {
-		return out, &memmap.BusError{io.EOF}
+		return out, &memmap.BusError{Err: io.EOF}
 	}
 	return out, nil
 }
