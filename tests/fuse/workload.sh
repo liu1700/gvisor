@@ -27,6 +27,7 @@ wait_mounted() {
 
 stop_owned_mount() {
   local pid=$1 label=$2 i signal=unmount
+  last_stop_signal=unmount
   fusermount3 -u "$mountpoint" >"$data/${label}-unmount.log" 2>&1 || true
   for ((i=0; i<20; i++)); do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -42,6 +43,7 @@ stop_owned_mount() {
     sleep 0.05
   done
   signal=TERM
+  last_stop_signal=TERM
   kill -TERM "$pid" 2>/dev/null || true
   for ((i=0; i<50; i++)); do
     ! kill -0 "$pid" 2>/dev/null && { wait "$pid" 2>/dev/null || true; mounted && { printf '{"case":"cleanup","ok":false,"label":"%s","error":"mounted-after-exit"}\n' "$label"; return 1; }; printf '{"case":"cleanup","ok":true,"label":"%s","signal":"%s"}\n' "$label" "$signal"; return; }

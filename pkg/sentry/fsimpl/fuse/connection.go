@@ -76,7 +76,7 @@ func (dc *deviceConn) release(ctx context.Context) {
 		panic("FUSE device connection released without a mount")
 	}
 	dc.conn.mounts--
-	last := dc.conn.mounts == 0
+	last := dc.conn.mounts == 0 && dc.conn.connected
 	if last {
 		// Publish disconnection before another mount can inspect this
 		// connection. A concurrent mount will create a new connection instead
