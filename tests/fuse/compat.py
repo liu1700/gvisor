@@ -51,8 +51,53 @@ def mmap_matrix(root):
         shared.flush(); os.fsync(first.fileno())
         emit("mmap-dirty-vs-concurrent-pwrite",
              writer.returncode == 0 and os.pread(sibling.fileno(), 1, 100) == b"\xa1" and os.pread(sibling.fileno(), 1, 200) == b"\x7f")
+
+        alias = root / "matrix.alias"
+        os.link(path, alias)
+        with alias.open("r+b", buffering=0) as alias_file:
+            alias_map = mmap.mmap(alias_file.fileno(), len(original), access=mmap.ACCESS_WRITE)
+            shared[300:306] = b"LINKED"
+            emit("mmap-hardlink-shared-page", alias_map[300:306] == b"LINKED")
+            alias_map.close()
         private.close()
         shared.close()
+
+    # KEEP_SIZE and range operations must update mapped pages without losing
+    # dirty data outside the operated range.
+    range_path = root / "ranges.bin"
+    range_path.write_bytes(pattern(4 * 4096, 13))
+    with range_path.open("r+b", buffering=0) as f:
+        mapped = mmap.mmap(f.fileno(), 4 * 4096, access=mmap.ACCESS_WRITE)
+        mapped[31:37] = b"PREFIX"
+        mapped[-6:] = b"SUFFIX"
+        libc = __import__("ctypes").CDLL(None, use_errno=True)
+        def fallocate(mode, offset, length):
+            __import__("ctypes").set_errno(0)
+            rc = libc.fallocate(f.fileno(), mode, offset, length)
+            return rc, __import__("ctypes").get_errno()
+        before_size = os.fstat(f.fileno()).st_size
+        keep_rc, keep_errno = fallocate(1, before_size, 4096)
+        emit("fallocate-keep-size", keep_rc == 0 and os.fstat(f.fileno()).st_size == before_size,
+             errno=keep_errno)
+        punch_rc, punch_errno = fallocate(1 | 2, 4096, 4096)
+        zero_rc, zero_errno = fallocate(16, 8192, 4096)
+        range_ok = (punch_rc == 0 and zero_rc == 0 and mapped[4096:8192] == bytes(4096)
+                    and mapped[8192:12288] == bytes(4096)
+                    and mapped[31:37] == b"PREFIX" and mapped[-6:] == b"SUFFIX")
+        emit("fallocate-punch-zero-mmap-coherence", range_ok,
+             punch_errno=punch_errno, zero_errno=zero_errno)
+        mapped.flush(); os.fsync(f.fileno()); mapped.close()
+
+    lifetime_write = root / "dirty-after-close.bin"
+    lifetime_write.write_bytes(bytes(8192))
+    fd = os.open(lifetime_write, os.O_RDWR)
+    dirty_map = mmap.mmap(fd, 8192, access=mmap.ACCESS_WRITE)
+    os.close(fd)
+    dirty_map[4090:4107] = b"DIRTY-AFTER-CLOSE"
+    dirty_map.close()
+    with lifetime_write.open("rb", buffering=0) as fresh:
+        persisted = os.pread(fresh.fileno(), 17, 4090) == b"DIRTY-AFTER-CLOSE"
+    emit("mmap-dirty-after-close-munmap", persisted)
 
     # Fault page 2, truncate it away, then require a later access to fail in a
     # subprocess. SIGBUS must not terminate the main JSON producer.
@@ -108,7 +153,10 @@ os.unlink(p); f.close(); want=bytes(((i*31+7+11)&255) for i in range(4096,4104))
         emit("mmap-inherited-fd-exec", result.returncode == 0, returncode=result.returncode)
 
     expected = hashlib.sha256(path.read_bytes()).hexdigest()
-    pathlib.Path(os.environ.get("FUSE_TEST_DATA", "/data"), "matrix.expected").write_text(f"{path.name} {path.stat().st_size} {expected}\n")
+    lifetime_expected = hashlib.sha256(lifetime_write.read_bytes()).hexdigest()
+    pathlib.Path(os.environ.get("FUSE_TEST_DATA", "/data"), "matrix.expected").write_text(
+        f"{path.name} {path.stat().st_size} {expected}\n"
+        f"{lifetime_write.name} {lifetime_write.stat().st_size} {lifetime_expected}\n")
 
 
 def lock_matrix(root):
@@ -151,6 +199,22 @@ f=open(sys.argv[1],'r+'); fcntl.lockf(f,fcntl.LOCK_EX); print('held',flush=True)
         fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.lockf(f, fcntl.LOCK_UN)
     emit("fcntl-lock-release", child.returncode == 0)
+
+    alias = pathlib.Path(root) / "lock.alias"
+    os.link(path, alias)
+    child = subprocess.Popen([sys.executable, "-c", """
+import fcntl,sys,time
+f=open(sys.argv[1],'r+'); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); time.sleep(1)
+""", str(path)], stdout=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == "held"
+    with alias.open("r+") as contender:
+        try:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            alias_blocked = False
+        except BlockingIOError as exc:
+            alias_blocked = exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+    child.wait(timeout=5)
+    emit("hardlink-alias-lock-contention", alias_blocked and child.returncode == 0)
 
 
 def sqlite_matrix(root):
@@ -220,17 +284,21 @@ def verify(root):
         checked += 1
     expected_path = pathlib.Path(os.environ.get("FUSE_TEST_DATA", "/data"), "matrix.expected")
     if expected_path.exists():
-        name, size, digest = expected_path.read_text().split()
-        payload = root / name
-        detail["matrix_size"] = payload.stat().st_size
-        detail["matrix_sha256"] = hashlib.sha256(payload.read_bytes()).hexdigest()
-        detail["matrix_expected"] = digest
-        checked += 1
+        persisted = {}
+        for line in expected_path.read_text().splitlines():
+            name, size, digest = line.split()
+            payload = root / name
+            actual = hashlib.sha256(payload.read_bytes()).hexdigest()
+            persisted[name] = {"size": payload.stat().st_size, "expected_size": int(size),
+                               "sha256": actual, "expected_sha256": digest}
+        detail["persisted"] = persisted
+        checked += len(persisted)
     ok = checked > 0
     if "integrity" in detail:
         ok = ok and detail["integrity"] == "ok" and detail["rows"] == 1002
-    if "matrix_expected" in detail:
-        ok = ok and detail["matrix_sha256"] == detail["matrix_expected"] and detail["matrix_size"] == int(size)
+    if "persisted" in detail:
+        ok = ok and all(item["sha256"] == item["expected_sha256"] and
+                        item["size"] == item["expected_size"] for item in detail["persisted"].values())
     emit("remount-persistence", ok, checked=checked, **detail)
 
 

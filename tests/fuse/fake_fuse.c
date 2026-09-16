@@ -22,6 +22,9 @@ enum {
   FSYNC_EIO_INO,
   FSYNC_NOSYS_INO,
   WRITE_STATS_INO,
+  READ_EIO_INO,
+  WRITE_EIO_INO,
+  DISCONNECT_INO,
 };
 
 static const char static_data[] = "static-fuse-data\n";
@@ -62,6 +65,9 @@ static fuse_ino_t name_ino(const char *name) {
   if (strcmp(name, "fsync-eio") == 0) return FSYNC_EIO_INO;
   if (strcmp(name, "fsync-nosys") == 0) return FSYNC_NOSYS_INO;
   if (strcmp(name, "write-stats") == 0) return WRITE_STATS_INO;
+  if (strcmp(name, "read-eio") == 0) return READ_EIO_INO;
+  if (strcmp(name, "write-eio") == 0) return WRITE_EIO_INO;
+  if (strcmp(name, "disconnect") == 0) return DISCONNECT_INO;
   return 0;
 }
 
@@ -78,7 +84,7 @@ static void op_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 
 static void op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
   (void)fi;
-  if (ino < ROOT_INO || ino > WRITE_STATS_INO) {
+  if (ino < ROOT_INO || ino > DISCONNECT_INO) {
     fuse_reply_err(req, ENOENT);
     return;
   }
@@ -88,7 +94,7 @@ static void op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 }
 
 static void op_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
-  if (ino < STATIC_INO || ino > WRITE_STATS_INO) {
+  if (ino < STATIC_INO || ino > DISCONNECT_INO) {
     fuse_reply_err(req, EISDIR);
     return;
   }
@@ -119,7 +125,11 @@ static void reply_buf(fuse_req_t req, const char *data, size_t data_len, size_t 
 static void op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                     struct fuse_file_info *fi) {
   (void)fi;
-  if (ino == DYNAMIC_INO) {
+  if (ino == READ_EIO_INO) {
+    fuse_reply_err(req, EIO);
+  } else if (ino == DISCONNECT_INO) {
+    _exit(0);
+  } else if (ino == DYNAMIC_INO) {
     reply_buf(req, dynamic_data, sizeof(dynamic_data) - 1, size, off);
   } else if (ino == WRITE_STATS_INO) {
     char stats[128];
@@ -133,7 +143,11 @@ static void op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 static void op_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size,
                      off_t off, struct fuse_file_info *fi) {
-  (void)ino; (void)buf; (void)off; (void)fi;
+  (void)buf; (void)off; (void)fi;
+  if (ino == WRITE_EIO_INO) {
+    fuse_reply_err(req, EIO);
+    return;
+  }
   written_total += size;
   if (size > written_max) written_max = size;
   if (size == 0 && off != 0) zero_write_nonzero_offset++;

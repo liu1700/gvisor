@@ -191,6 +191,16 @@ static int fake_protocol_case(const char *root) {
   printf("{\"case\":\"fake-directio-zero-size-read\",\"ok\":%s,\"size\":%lld,\"bytes\":%zd}\n",
          dynamic_ok ? "true" : "false", (long long)st.st_size, n);
 
+  snprintf(path, sizeof(path), "%s/read-eio", root);
+  fd = open(path, O_RDONLY); errno = 0; n = read(fd, buf, 1);
+  int read_errno = errno; close(fd);
+  snprintf(path, sizeof(path), "%s/write-eio", root);
+  fd = open(path, O_WRONLY); errno = 0; ssize_t error_write = write(fd, "x", 1);
+  int write_errno = errno; close(fd);
+  int io_error_ok = n == -1 && read_errno == EIO && error_write == -1 && write_errno == EIO;
+  printf("{\"case\":\"fake-daemon-io-errors\",\"ok\":%s,\"read_errno\":%d,\"write_errno\":%d}\n",
+         io_error_ok ? "true" : "false", read_errno, write_errno);
+
   int direct_mmap_ok = 1;
   const char *direct_names[] = {"direct", "dynamic"};
   for (size_t i = 0; i < 2; ++i) {
@@ -210,12 +220,29 @@ static int fake_protocol_case(const char *root) {
     printf("{\"case\":\"fake-directio-mmap-%s\",\"ok\":%s,\"private_errno\":%d,\"shared_errno\":%d}\n",
            direct_names[i], one_ok ? "true" : "false", private_errno, shared_errno);
   }
-  return mmap_ok && dynamic_ok && direct_mmap_ok && write_ok ? 0 : 45;
+  return mmap_ok && dynamic_ok && direct_mmap_ok && write_ok && io_error_ok ? 0 : 45;
+}
+
+static int disconnect_case(const char *root) {
+  char path[512], byte;
+  snprintf(path, sizeof(path), "%s/disconnect", root);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return 61;
+  long long started = monotonic_ms();
+  errno = 0;
+  ssize_t n = read(fd, &byte, 1);
+  int saved_errno = errno;
+  long long elapsed = monotonic_ms() - started;
+  close(fd);
+  int ok = n == -1 && (saved_errno == EIO || saved_errno == ENOTCONN) && elapsed < 2000;
+  printf("{\"case\":\"fake-daemon-disconnect\",\"ok\":%s,\"errno\":%d,\"elapsed_ms\":%lld}\n",
+         ok ? "true" : "false", saved_errno, elapsed);
+  return ok ? 0 : 62;
 }
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: %s fsync MOUNTPOINT [DELAY_MS] | fake MOUNTPOINT | mmap ROOT\n", argv[0]);
+    fprintf(stderr, "usage: %s fsync MOUNTPOINT [DELAY_MS] | fake|disconnect MOUNTPOINT | mmap ROOT\n", argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "fsync") == 0) {
@@ -237,6 +264,7 @@ int main(int argc, char **argv) {
     return e;
   }
   if (strcmp(argv[1], "fake") == 0) return fake_protocol_case(argv[2]);
+  if (strcmp(argv[1], "disconnect") == 0) return disconnect_case(argv[2]);
   if (strcmp(argv[1], "mmap") == 0) return mmap_case(argv[2]);
   return 2;
 }

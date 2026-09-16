@@ -56,6 +56,7 @@ run_fake() {
   local failures=0
   "$bin_dir/syscall-probe" fake "$mountpoint" || failures=1
   "$bin_dir/syscall-probe" fsync "$mountpoint" 300 || failures=1
+  "$bin_dir/syscall-probe" disconnect "$mountpoint" || failures=1
   stop_owned_mount "$mount_pid" fake
   trap - EXIT
   cat "$data/fake-server.jsonl"
@@ -87,6 +88,10 @@ run_juicefs() {
   start_juicefs first
   case "$case_name" in
     mmap) "$bin_dir/syscall-probe" mmap "$mountpoint" || failures=1; python3 "$bin_dir/compat.py" matrix "$mountpoint" || failures=1 ;;
+    correctness)
+      python3 "$bin_dir/compat.py" matrix "$mountpoint" || failures=1
+      python3 "$bin_dir/compat.py" locks "$mountpoint" || failures=1
+      ;;
     git) python3 "$bin_dir/compat.py" git "$mountpoint" || failures=1 ;;
     control) python3 "$bin_dir/compat.py" control "$mountpoint" || failures=1 ;;
     all)
@@ -103,7 +108,7 @@ run_juicefs() {
   stop_owned_mount "$mount_pid" first
   trap - EXIT
 
-  if [[ "$case_name" == all || "$case_name" == git ]]; then
+  if [[ "$case_name" == all || "$case_name" == git || "$case_name" == correctness ]]; then
     rm -rf "$data/cache"/*
     start_juicefs second
     python3 "$bin_dir/compat.py" verify "$mountpoint" || failures=1
@@ -127,7 +132,7 @@ mount_label=
 case "$case_name" in
   diagnostic) run_fake ;;
   all) run_all ;;
-  mmap|git|control) run_juicefs ;;
+  mmap|correctness|git|control) run_juicefs ;;
   *) json case workload ok false error "unsupported case: $case_name"; exit 2 ;;
 esac
 printf '{"case":"workload-complete","ok":true,"selected":"%s"}\n' "$case_name"

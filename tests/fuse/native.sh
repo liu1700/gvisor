@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if (($# != 3)); then
-  echo "usage: $0 JUICEFS_BINARY diagnostic|mmap|control|all OUTPUT" >&2
+  echo "usage: $0 JUICEFS_BINARY diagnostic|mmap|correctness|control|all OUTPUT" >&2
   exit 2
 fi
 juicefs=$1 selected=$2 output=$3
-[[ -x "$juicefs" && "$selected" =~ ^(diagnostic|mmap|control|all)$ ]] || exit 2
+[[ -x "$juicefs" && "$selected" =~ ^(diagnostic|mmap|correctness|control|all)$ ]] || exit 2
 base=${FUSE_TEST_TMPDIR:-/tmp/gvisor-fuse-native}
 mkdir -p "$base" "$(dirname "$output")"
 run_dir=$(mktemp -d "$base/run.XXXXXX")
