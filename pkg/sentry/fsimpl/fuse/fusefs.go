@@ -398,7 +398,7 @@ func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode
 	return &d
 }
 
-func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (kernfs.Inode, error) {
+func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut, attributeVersion uint64) (kernfs.Inode, error) {
 	attr := out.Attr
 	if !isValidType(attr.Mode) {
 		return nil, linuxerr.EIO
@@ -406,6 +406,13 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (ker
 	fs.inodesMu.Lock()
 	if old := fs.inodes[out.NodeID]; old != nil && old.generation == out.Generation && old.TryIncRef() {
 		fs.inodesMu.Unlock()
+		old.attrMu.Lock()
+		// Do not overwrite an attribute change made after this lookup began.
+		if old.attrVersion.Load() <= attributeVersion {
+			old.updateAttrs(ctx, out.Attr, int64(out.AttrValid), int64(out.AttrValidNSec))
+		}
+		old.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
+		old.attrMu.Unlock()
 		return old, nil
 	}
 	defer fs.inodesMu.Unlock()

@@ -249,6 +249,7 @@ func (i *inode) allowCredentials(creds *auth.Credentials) bool {
 // FUSE_LINK and FUSE_LOOKUP.
 func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMode, opcode linux.FUSEOpcode, payload marshal.Marshallable) (kernfs.Inode, error) {
 	out := linux.FUSECreateOut{}
+	attributeVersion := i.fs.conn.attributeVersion.Load()
 	var err error
 	if opcode == linux.FUSE_CREATE {
 		err = i.call(ctx, opcode, payload, &out)
@@ -261,7 +262,7 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}
-	child, err := i.fs.newInode(ctx, out.FUSEEntryOut)
+	child, err := i.fs.newInode(ctx, out.FUSEEntryOut, attributeVersion)
 	if err != nil {
 		return nil, err
 	}
