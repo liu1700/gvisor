@@ -26,8 +26,22 @@ wait_mounted() {
 }
 
 stop_owned_mount() {
-  local pid=$1 label=$2 i signal=TERM
+  local pid=$1 label=$2 i signal=unmount
   fusermount3 -u "$mountpoint" >"$data/${label}-unmount.log" 2>&1 || true
+  for ((i=0; i<20; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      if mounted; then
+        printf '{"case":"cleanup","ok":false,"label":"%s","error":"mounted-after-exit"}\n' "$label"
+        return 1
+      fi
+      last_stop_signal=$signal
+      printf '{"case":"cleanup","ok":true,"label":"%s","signal":"%s"}\n' "$label" "$signal"
+      return 0
+    fi
+    sleep 0.05
+  done
+  signal=TERM
   kill -TERM "$pid" 2>/dev/null || true
   for ((i=0; i<50; i++)); do
     ! kill -0 "$pid" 2>/dev/null && { wait "$pid" 2>/dev/null || true; mounted && { printf '{"case":"cleanup","ok":false,"label":"%s","error":"mounted-after-exit"}\n' "$label"; return 1; }; printf '{"case":"cleanup","ok":true,"label":"%s","signal":"%s"}\n' "$label" "$signal"; return; }
@@ -40,7 +54,27 @@ stop_owned_mount() {
     printf '{"case":"cleanup","ok":false,"label":"%s","signal":"%s"}\n' "$label" "$signal"
     return 1
   fi
+  last_stop_signal=$signal
   printf '{"case":"cleanup","ok":true,"label":"%s","signal":"%s"}\n' "$label" "$signal"
+}
+
+run_fake_clean_unmount() {
+  "$bin_dir/fake-fuse" "$mountpoint" 0 >"$data/fake-clean-server.jsonl" 2>"$data/fake-clean-server.err" &
+  mount_pid=$!
+  mount_label=fake-clean
+  trap 'stop_owned_mount "$mount_pid" "$mount_label"' EXIT
+  if ! wait_mounted "$mount_pid"; then
+    cat "$data/fake-clean-server.err" >&2
+    return 1
+  fi
+  if stop_owned_mount "$mount_pid" fake-clean && [[ "$last_stop_signal" == unmount ]]; then
+    trap - EXIT
+    printf '{"case":"fake-clean-unmount","ok":true}\n'
+    return 0
+  fi
+  trap - EXIT
+  printf '{"case":"fake-clean-unmount","ok":false}\n'
+  return 1
 }
 
 run_fake() {
@@ -60,6 +94,7 @@ run_fake() {
   stop_owned_mount "$mount_pid" fake
   trap - EXIT
   cat "$data/fake-server.jsonl"
+  run_fake_clean_unmount || failures=1
   return "$failures"
 }
 
@@ -128,6 +163,7 @@ run_all() {
 
 mount_pid=
 mount_label=
+last_stop_signal=
 
 case "$case_name" in
   diagnostic) run_fake ;;

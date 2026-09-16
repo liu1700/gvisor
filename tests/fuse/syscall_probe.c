@@ -234,7 +234,10 @@ static int disconnect_case(const char *root) {
   int saved_errno = errno;
   long long elapsed = monotonic_ms() - started;
   close(fd);
-  int ok = n == -1 && (saved_errno == EIO || saved_errno == ENOTCONN) && elapsed < 2000;
+  // The read that makes the daemon exit is already in flight. Linux completes
+  // such requests with ECONNABORTED; a request submitted after disconnect gets
+  // ENOTCONN. Accept both disconnect states, plus EIO from compatible kernels.
+  int ok = n == -1 && (saved_errno == ECONNABORTED || saved_errno == ENOTCONN || saved_errno == EIO) && elapsed < 2000;
   printf("{\"case\":\"fake-daemon-disconnect\",\"ok\":%s,\"errno\":%d,\"elapsed_ms\":%lld}\n",
          ok ? "true" : "false", saved_errno, elapsed);
   return ok ? 0 : 62;
