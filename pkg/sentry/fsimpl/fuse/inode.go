@@ -122,10 +122,9 @@ type inode struct {
 	dataMu   sync.Mutex `state:"nosave"`
 	cache    fsutil.FileRangeSet
 	dirty    fsutil.DirtySet
-	// writebackFD lends its FUSE handle to the inode while pages are dirty.
-	// This is a Go pointer, not a VFS reference: the handle transfer avoids a
-	// reference cycle between a dirty inode and its file description.
-	writebackFD *regularFileFD
+	// writeback owns the daemon handle while mapped pages are dirty.
+	// It does not retain a VFS reference to the inode.
+	writeback *writebackHandle
 }
 
 var _ pgalloc.EvictableMemoryUser = (*inode)(nil)

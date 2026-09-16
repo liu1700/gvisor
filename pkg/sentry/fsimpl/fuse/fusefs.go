@@ -451,8 +451,8 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	for _, i := range inodes {
 		i.dataMu.Lock()
 		err := i.syncMappedLocked(ctx)
-		if err == nil && i.writebackFD != nil {
-			in := linux.FUSEFsyncIn{Fh: i.writebackFD.Fh}
+		if err == nil && i.writeback != nil {
+			in := linux.FUSEFsyncIn{Fh: i.writeback.fh}
 			err = i.call(ctx, linux.FUSE_FSYNC, &in, nil)
 			if linuxerr.Equals(linuxerr.ENOSYS, err) {
 				err = nil

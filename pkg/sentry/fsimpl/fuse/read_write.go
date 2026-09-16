@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
 func (fd *regularFileFD) readToBlocksAt(ctx context.Context, dsts safemem.BlockSeq, off uint64) (uint64, error) {
@@ -71,17 +72,21 @@ func (fd *regularFileFD) readToBlocksAt(ctx context.Context, dsts safemem.BlockS
 }
 
 func (fd *regularFileFD) writeFromBlocksAt(ctx context.Context, srcs safemem.BlockSeq, off uint64) (uint64, error) {
+	return fd.inode().writeHandle(ctx, srcs, off, fd.Fh, fd.statusFlags(), fd.vfsfd.Credentials(), false)
+}
+
+func (i *inode) writeHandle(ctx context.Context, srcs safemem.BlockSeq, off, fh uint64, flags uint32, creds *auth.Credentials, cached bool) (uint64, error) {
 	if srcs.IsEmpty() {
 		return 0, nil
 	}
 	var done uint64
 	for !srcs.IsEmpty() {
 		n := srcs.NumBytes()
-		max := uint64(fd.inode().fs.conn.maxWrite)
-		if pages := uint64(fd.inode().fs.conn.maxPages) << hostarch.PageShift; pages < max {
+		max := uint64(i.fs.conn.maxWrite)
+		if pages := uint64(i.fs.conn.maxPages) << hostarch.PageShift; pages < max {
 			max = pages
 		}
-		if !fd.inode().fs.conn.bigWrites && max > hostarch.PageSize {
+		if !i.fs.conn.bigWrites && max > hostarch.PageSize {
 			max = hostarch.PageSize
 		}
 		if max == 0 {
@@ -96,9 +101,20 @@ func (fd *regularFileFD) writeFromBlocksAt(ctx context.Context, srcs safemem.Blo
 			return done, err
 		}
 		buf = buf[:copied]
-		in := linux.FUSEWritePayloadIn{Header: linux.FUSEWriteIn{Fh: fd.Fh, Offset: off + done, Size: uint32(copied), Flags: fd.statusFlags()}, Payload: buf}
+		in := linux.FUSEWritePayloadIn{Header: linux.FUSEWriteIn{Fh: fh, Offset: off + done, Size: uint32(copied), Flags: flags}, Payload: buf}
+		if cached {
+			in.Header.WriteFlags = 1
+		} // FUSE_WRITE_CACHE: writeback from a mapped page.
+		req := i.fs.conn.NewRequest(creds, pidFromContext(ctx), i.nodeID, linux.FUSE_WRITE, &in)
+		res, err := i.fs.conn.Call(ctx, req)
+		if err != nil {
+			return done, err
+		}
+		if err := res.Error(); err != nil {
+			return done, err
+		}
 		var out linux.FUSEWriteOut
-		if err := fd.inode().call(ctx, linux.FUSE_WRITE, &in, &out); err != nil {
+		if err := res.UnmarshalPayload(&out); err != nil {
 			return done, err
 		}
 		if out.Size > uint32(copied) {

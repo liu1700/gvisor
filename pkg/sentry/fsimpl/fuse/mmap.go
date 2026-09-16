@@ -15,12 +15,14 @@
 package fuse
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -78,7 +80,7 @@ func (fd *regularFileFD) mmapTranslate(ctx context.Context, required, optional m
 	}
 	i.dataMu.Lock()
 	defer i.dataMu.Unlock()
-	if at.Write && i.writebackFD == nil {
+	if at.Write && i.writeback == nil {
 		i.retainWritebackLocked(fd)
 	}
 	pgend, _ := hostarch.PageRoundUp(i.size.Load())
@@ -187,31 +189,54 @@ func (rw *fileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error)
 	// place so concurrent MAP_SHARED writes to other bytes cannot be discarded.
 	n, err := rw.fd.writeFromBlocksAt(rw.ctx, srcs, rw.off)
 	end := rw.off + n
-	for seg := i.cache.LowerBoundSegment(rw.off); seg.Ok() && seg.Start() < end; seg, _ = seg.NextNonEmpty() {
-		r := seg.Range().Intersect(memmap.MappableRange{Start: rw.off, End: end})
-		blocks, mapErr := i.fs.mf.MapInternal(seg.FileRangeOf(r), hostarch.Write)
-		if mapErr != nil {
-			return 0, mapErr
-		}
-		if _, copyErr := safemem.CopySeq(blocks, srcs.DropFirst64(r.Start-rw.off).TakeFirst64(r.Length())); copyErr != nil {
-			return 0, copyErr
-		}
-	}
+	start := rw.off
 	rw.off = end
 	if end > i.size.Load() {
 		i.size.Store(end)
 	}
+	for seg := i.cache.LowerBoundSegment(start); seg.Ok() && seg.Start() < end; seg, _ = seg.NextNonEmpty() {
+		r := seg.Range().Intersect(memmap.MappableRange{Start: start, End: end})
+		blocks, mapErr := i.fs.mf.MapInternal(seg.FileRangeOf(r), hostarch.Write)
+		if mapErr != nil {
+			return n, mapErr
+		}
+		if _, copyErr := safemem.CopySeq(blocks, srcs.DropFirst64(r.Start-start).TakeFirst64(r.Length())); copyErr != nil {
+			return n, copyErr
+		}
+	}
 	return n, err
 }
 
-// retainWritebackLocked transfers ownership of an existing FUSE handle. VFS
-// mappings keep the inode alive; its cache owns this handle after FD release.
+// +stateify savable
+type writebackHandle struct {
+	fh    uint64
+	flags uint32
+	creds *auth.Credentials
+	// owner is cleared in Release before VFS drops the dentry reference. It is
+	// used only to return handle ownership to a still-live file description.
+	owner *regularFileFD
+}
+
 // Preconditions: i.dataMu is locked.
 func (i *inode) retainWritebackLocked(fd *regularFileFD) {
-	if i.writebackFD == nil {
-		i.writebackFD = fd
+	if i.writeback == nil {
+		i.writeback = &writebackHandle{fh: fd.Fh, flags: fd.statusFlags(), creds: fd.vfsfd.Credentials(), owner: fd}
 		fd.handleTransferred = true
 	}
+}
+
+func (i *inode) writebackAt(ctx context.Context, srcs safemem.BlockSeq, off uint64) (uint64, error) {
+	h := i.writeback
+	return i.writeHandle(ctx, srcs, off, h.fh, h.flags, h.creds, true)
+}
+
+func (i *inode) releaseWriteback(ctx context.Context, h *writebackHandle) {
+	if h == nil || i.fs.conn.noOpen {
+		return
+	}
+	in := linux.FUSEReleaseIn{Fh: h.fh, Flags: h.flags}
+	req := i.fs.conn.NewRequest(h.creds, pidFromContext(ctx), i.nodeID, linux.FUSE_RELEASE, &in)
+	i.fs.conn.Call(ctx, req)
 }
 
 // syncMapped does not acquire attrMu: faults and eviction must never wait for
@@ -226,10 +251,10 @@ func (i *inode) syncMappedLocked(ctx context.Context) error {
 	if i.dirty.IsEmpty() {
 		return nil
 	}
-	if i.writebackFD == nil {
+	if i.writeback == nil {
 		return linuxerr.EIO
 	}
-	return fsutil.SyncDirtyAll(ctx, &i.cache, &i.dirty, i.size.Load(), i.fs.mf, i.writebackFD.writeFromBlocksAt)
+	return fsutil.SyncDirtyAll(ctx, &i.cache, &i.dirty, i.size.Load(), i.fs.mf, i.writebackAt)
 }
 
 // updateSizeMMap requires attrMu. dataMu protects size against Translate and
@@ -270,8 +295,8 @@ func (i *inode) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 		if r.Length() == 0 {
 			continue
 		}
-		if i.writebackFD != nil {
-			if err := fsutil.SyncDirty(ctx, r, &i.cache, &i.dirty, i.size.Load(), i.fs.mf, i.writebackFD.writeFromBlocksAt); err != nil {
+		if i.writeback != nil {
+			if err := fsutil.SyncDirty(ctx, r, &i.cache, &i.dirty, i.size.Load(), i.fs.mf, i.writebackAt); err != nil {
 				log.Warningf("FUSE cache writeback failed: %v", err)
 				continue
 			}
@@ -282,31 +307,31 @@ func (i *inode) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 	fd := i.detachCleanHandleLocked()
 	i.dataMu.Unlock()
 	i.mapsMu.Unlock()
-	if fd != nil {
-		fd.fileDescription.Release(ctx)
-	}
+	i.releaseWriteback(ctx, fd)
 }
 
 // detachCleanHandleLocked returns a handle that must be released outside
 // dataMu. A still-open descriptor resumes normal ownership of its handle.
-func (i *inode) detachCleanHandleLocked() *regularFileFD {
-	if !i.dirty.IsEmpty() || i.writebackFD == nil {
+func (i *inode) detachCleanHandleLocked() *writebackHandle {
+	if !i.dirty.IsEmpty() || i.writeback == nil {
 		return nil
 	}
-	fd := i.writebackFD
-	i.writebackFD = nil
-	fd.handleTransferred = false
-	if fd.released {
-		return fd
+	h := i.writeback
+	i.writeback = nil
+	if h.owner != nil {
+		h.owner.handleTransferred = false
+		return nil
 	}
-	return nil
+	return h
 }
 
 func (fd *regularFileFD) Release(ctx context.Context) {
 	i := fd.inode()
 	i.dataMu.Lock()
-	fd.released = true
 	transferred := fd.handleTransferred
+	if transferred {
+		i.writeback.owner = nil
+	}
 	i.dataMu.Unlock()
 	if !transferred {
 		fd.fileDescription.Release(ctx)
@@ -319,14 +344,12 @@ func (i *inode) destroyCache(ctx context.Context) {
 	if err := i.syncMappedLocked(ctx); err != nil {
 		log.Warningf("FUSE final cache writeback failed: %v", err)
 	}
-	fd := i.writebackFD
-	i.writebackFD = nil
+	fd := i.writeback
+	i.writeback = nil
 	i.cache.DropAll(i.fs.mf)
 	i.dirty.RemoveAllAndAccount()
 	i.dataMu.Unlock()
-	if fd != nil {
-		fd.fileDescription.Release(ctx)
-	}
+	i.releaseWriteback(ctx, fd)
 }
 
 // OnClose flushes mapped writes made before close, including when a mapping

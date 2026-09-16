@@ -42,7 +42,6 @@ type regularFileFD struct {
 	// Protected by inode.dataMu. A transferred handle outlives VFS Release
 	// until the inode has written its dirty pages.
 	handleTransferred bool
-	released          bool
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.

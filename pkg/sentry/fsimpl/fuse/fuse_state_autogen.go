@@ -451,7 +451,7 @@ func (i *inode) StateFields() []string {
 		"mappings",
 		"cache",
 		"dirty",
-		"writebackFD",
+		"writeback",
 	}
 }
 
@@ -489,7 +489,7 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(26, &i.mappings)
 	stateSinkObject.Save(27, &i.cache)
 	stateSinkObject.Save(28, &i.dirty)
-	stateSinkObject.Save(29, &i.writebackFD)
+	stateSinkObject.Save(29, &i.writeback)
 }
 
 func (i *inode) afterLoad(context.Context) {}
@@ -525,7 +525,7 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(26, &i.mappings)
 	stateSourceObject.Load(27, &i.cache)
 	stateSourceObject.Load(28, &i.dirty)
-	stateSourceObject.Load(29, &i.writebackFD)
+	stateSourceObject.Load(29, &i.writeback)
 }
 
 func (r *inodeRefs) StateTypeName() string {
@@ -552,6 +552,40 @@ func (r *inodeRefs) StateLoad(ctx context.Context, stateSourceObject state.Sourc
 	stateSourceObject.AfterLoad(func() { r.afterLoad(ctx) })
 }
 
+func (w *writebackHandle) StateTypeName() string {
+	return "pkg/sentry/fsimpl/fuse.writebackHandle"
+}
+
+func (w *writebackHandle) StateFields() []string {
+	return []string{
+		"fh",
+		"flags",
+		"creds",
+		"owner",
+	}
+}
+
+func (w *writebackHandle) beforeSave() {}
+
+// +checklocksignore
+func (w *writebackHandle) StateSave(stateSinkObject state.Sink) {
+	w.beforeSave()
+	stateSinkObject.Save(0, &w.fh)
+	stateSinkObject.Save(1, &w.flags)
+	stateSinkObject.Save(2, &w.creds)
+	stateSinkObject.Save(3, &w.owner)
+}
+
+func (w *writebackHandle) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (w *writebackHandle) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &w.fh)
+	stateSourceObject.Load(1, &w.flags)
+	stateSourceObject.Load(2, &w.creds)
+	stateSourceObject.Load(3, &w.owner)
+}
+
 func (fd *regularFileFD) StateTypeName() string {
 	return "pkg/sentry/fsimpl/fuse.regularFileFD"
 }
@@ -561,7 +595,6 @@ func (fd *regularFileFD) StateFields() []string {
 		"fileDescription",
 		"off",
 		"handleTransferred",
-		"released",
 	}
 }
 
@@ -573,7 +606,6 @@ func (fd *regularFileFD) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &fd.fileDescription)
 	stateSinkObject.Save(1, &fd.off)
 	stateSinkObject.Save(2, &fd.handleTransferred)
-	stateSinkObject.Save(3, &fd.released)
 }
 
 func (fd *regularFileFD) afterLoad(context.Context) {}
@@ -583,7 +615,6 @@ func (fd *regularFileFD) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(0, &fd.fileDescription)
 	stateSourceObject.Load(1, &fd.off)
 	stateSourceObject.Load(2, &fd.handleTransferred)
-	stateSourceObject.Load(3, &fd.released)
 }
 
 func (l *requestList) StateTypeName() string {
@@ -762,6 +793,7 @@ func init() {
 	state.Register((*fileHandle)(nil))
 	state.Register((*inode)(nil))
 	state.Register((*inodeRefs)(nil))
+	state.Register((*writebackHandle)(nil))
 	state.Register((*regularFileFD)(nil))
 	state.Register((*requestList)(nil))
 	state.Register((*requestEntry)(nil))
