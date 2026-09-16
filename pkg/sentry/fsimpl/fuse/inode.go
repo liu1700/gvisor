@@ -624,7 +624,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fd.OpenFlag &= ^uint32(linux.FOPEN_DIRECT_IO)
 	}
 
-	// TODO(gvisor.dev/issue/3234): invalidate mmap after implemented it for FUSE Inode
+	if fd.OpenFlag&linux.FOPEN_KEEP_CACHE == 0 && i.filemode().FileType() == linux.S_IFREG {
+		i.invalidateCleanCache(ctx)
+	}
 	fd.DirectIO = fd.OpenFlag&linux.FOPEN_DIRECT_IO != 0
 	fdOptions := &vfs.FileDescriptionOptions{}
 	if fd.OpenFlag&linux.FOPEN_NONSEEKABLE != 0 {

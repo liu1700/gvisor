@@ -360,3 +360,23 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	}
 	return fd.fileDescription.OnClose(ctx)
 }
+
+// invalidateCleanCache implements an OPEN reply without FOPEN_KEEP_CACHE.
+// Dirty pages are retained, as invalidate_inode_pages2() does on Linux when
+// they cannot be invalidated. Remove cache references before invalidating MM
+// translations: an existing translation keeps its memory-file reference alive,
+// and any concurrent new translation uses freshly loaded cache contents.
+func (i *inode) invalidateCleanCache(ctx context.Context) {
+	i.dataMu.Lock()
+	for gap := i.dirty.FirstGap(); gap.Ok(); gap = gap.NextGap() {
+		start, ok := hostarch.PageRoundUp(gap.Start())
+		end := uint64(hostarch.PageRoundDown(gap.End()))
+		if ok && end > start {
+			i.cache.Drop(memmap.MappableRange{Start: start, End: end}, i.fs.mf)
+		}
+	}
+	i.dataMu.Unlock()
+	i.mapsMu.Lock()
+	i.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	i.mapsMu.Unlock()
+}
