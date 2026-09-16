@@ -24,6 +24,23 @@ def pattern(size, salt=0):
 
 
 def mmap_matrix(root):
+    # utimensat must apply UTIME_NOW to mtime without changing an omitted atime.
+    import ctypes, time
+    stamp = pathlib.Path(root) / "mtime-now.bin"
+    stamp.write_bytes(b"timestamp")
+    os.utime(stamp, ns=(1_200_000_000_000_000_000, 1_300_000_000_000_000_000))
+    class Timespec(ctypes.Structure):
+        _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+    times = (Timespec * 2)(Timespec(0, (1 << 30) - 2), Timespec(0, (1 << 30) - 1))
+    libc = ctypes.CDLL(None, use_errno=True)
+    before = time.time_ns()
+    rc = libc.utimensat(-100, os.fsencode(stamp), times, 0)
+    after = time.time_ns()
+    st = stamp.stat()
+    emit("mtime-now-preserves-atime", rc == 0 and st.st_atime_ns == 1_200_000_000_000_000_000
+         and before - 1_000_000_000 <= st.st_mtime_ns <= after + 1_000_000_000,
+         errno=ctypes.get_errno(), atime_ns=st.st_atime_ns, mtime_ns=st.st_mtime_ns)
+
     root = pathlib.Path(root)
     path = root / "matrix.bin"
     original = pattern(3 * 4096 + 37)
