@@ -1716,8 +1716,14 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if !file.IsWritable() {
 		return 0, nil, linuxerr.EBADF
 	}
-	if mode != 0 {
-		return 0, nil, linuxerr.ENOTSUP
+	// Filesystems decide which allocation modes they implement. In particular,
+	// FUSE must be able to forward KEEP_SIZE and range operations to its daemon.
+	const known = linux.FALLOC_FL_KEEP_SIZE | linux.FALLOC_FL_PUNCH_HOLE | linux.FALLOC_FL_NO_HIDE_STALE | linux.FALLOC_FL_COLLAPSE_RANGE | linux.FALLOC_FL_ZERO_RANGE | linux.FALLOC_FL_INSERT_RANGE | linux.FALLOC_FL_UNSHARE_RANGE
+	if mode & ^uint64(known) != 0 {
+		return 0, nil, linuxerr.EOPNOTSUPP
+	}
+	if mode&linux.FALLOC_FL_PUNCH_HOLE != 0 && (mode&linux.FALLOC_FL_KEEP_SIZE == 0 || mode&linux.FALLOC_FL_ZERO_RANGE != 0) {
+		return 0, nil, linuxerr.EINVAL
 	}
 	if offset < 0 || length <= 0 {
 		return 0, nil, linuxerr.EINVAL
@@ -1728,7 +1734,7 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		return 0, nil, linuxerr.EFBIG
 	}
 	limit := limits.FromContext(t).Get(limits.FileSize).Cur
-	if uint64(size) >= limit {
+	if mode&linux.FALLOC_FL_KEEP_SIZE == 0 && uint64(size) > limit {
 		t.SendSignal(&linux.SignalInfo{
 			Signo: int32(linux.SIGXFSZ),
 			Code:  linux.SI_USER,

@@ -451,6 +451,10 @@ func (fd *regularFileFD) Release(context.Context) {
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	// Nonzero modes need cache and size semantics that this implementation does not yet provide.
+	if mode != 0 {
+		return linuxerr.EOPNOTSUPP
+	}
 	f := fd.inode().impl.(*regularFile)
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 

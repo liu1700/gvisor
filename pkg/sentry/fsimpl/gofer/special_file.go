@@ -198,6 +198,10 @@ func (fd *specialFileFD) Epollable() bool {
 }
 
 func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	// Nonzero modes need cache and size semantics that this implementation does not yet provide.
+	if mode != 0 {
+		return linuxerr.EOPNOTSUPP
+	}
 	if fd.isRegularFile {
 		d := fd.dentry()
 		return d.doAllocate(ctx, offset, length, func() error {
