@@ -28,7 +28,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -85,6 +87,11 @@ type filesystemOptions struct {
 //
 // +stateify savable
 type filesystem struct {
+	// Weak inode index: hard links and repeated lookups share mappings and locks.
+	inodesMu sync.Mutex `state:"nosave"`
+	inodes   map[uint64]*inode
+
+	mf *pgalloc.MemoryFile `state:"nosave"`
 	kernfs.Filesystem
 	devMinor uint32
 
@@ -161,8 +168,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // /dev/fuse DeviceFD.
 func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, kernelTask *kernel.Task, fuseFD *DeviceFD, devMinor uint32, fsopts *filesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	fuseFD.mu.Lock()
-	connected := fuseFD.connected()
-	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, fsopts)
+	fs, newConnection, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
 		fuseFD.mu.Unlock()
@@ -172,7 +178,7 @@ func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *
 
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
-	if !connected {
+	if newConnection {
 		if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
 			log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
 			return nil, nil, err
@@ -214,6 +220,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 	conn.fuseConn = hostConn
 
 	fs := &filesystem{
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 		devMinor: devMinor,
 		opts:     fsopts,
 		conn:     conn,
@@ -344,31 +351,48 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 
 // newFUSEFilesystem creates a new FUSE filesystem.
 // +checklocks:fuseFD.mu
-func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
-	if !fuseFD.connected() {
-		conn, err := newFUSEConnection(ctx, fuseFD, opts)
-		if err != nil {
-			log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
-			return nil, linuxerr.EINVAL
+func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, bool, error) {
+	newConnection := false
+	for {
+		if !fuseFD.connected() {
+			oldConn := fuseFD.conn
+			conn, err := newFUSEConnection(ctx, fuseFD, opts)
+			if err != nil {
+				log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
+				return nil, false, linuxerr.EINVAL
+			}
+			fuseFD.conn = conn
+			newConnection = true
+			// Transfer this DeviceFD's reference from a disconnected connection.
+			// Cloned device FDs retain their own references and are unaffected.
+			if oldConn != nil {
+				oldConn.DecRef(ctx)
+			}
 		}
-		fuseFD.conn = conn
+
+		if dc, ok := fuseFD.conn.fuseConn.(*deviceConn); !ok || dc.addMount() {
+			break
+		}
+		// Last unmount disconnected the connection between connected() and
+		// addMount(). Retry and create a new connection under fuseFD.mu.
 	}
 
 	fs := &filesystem{
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 		devMinor: devMinor,
 		opts:     opts,
 		conn:     fuseFD.conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
-	return fs, nil
+	return fs, newConnection, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.Filesystem.Release(ctx)
 	fs.conn.fuseConn.release(ctx)
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
-	fs.Filesystem.Release(ctx)
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
@@ -389,22 +413,39 @@ func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode
 	return &d
 }
 
-func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (kernfs.Inode, error) {
+func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut, attributeVersion uint64) (kernfs.Inode, error) {
 	attr := out.Attr
 	if !isValidType(attr.Mode) {
 		return nil, linuxerr.EIO
 	}
+	fs.inodesMu.Lock()
+	if old := fs.inodes[out.NodeID]; old != nil && old.generation == out.Generation && old.TryIncRef() {
+		fs.inodesMu.Unlock()
+		old.attrMu.Lock()
+		// Do not overwrite an attribute change made after this lookup began.
+		if old.attrVersion.Load() <= attributeVersion {
+			old.updateAttrs(ctx, out.Attr, int64(out.AttrValid), int64(out.AttrValidNSec))
+		}
+		old.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
+		old.attrMu.Unlock()
+		return old, nil
+	}
+	defer fs.inodesMu.Unlock()
 	i := &inode{fs: fs, nodeID: out.NodeID, generation: out.Generation}
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
 
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
 	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
-	i.updateAttrs(attr, int64(out.AttrValid), int64(out.AttrValidNSec))
+	i.updateAttrs(ctx, attr, int64(out.AttrValid), int64(out.AttrValidNSec))
 	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
 
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
+	if fs.inodes == nil {
+		fs.inodes = make(map[uint64]*inode)
+	}
+	fs.inodes[out.NodeID] = i
 	return i, nil
 }
 
@@ -416,4 +457,34 @@ func isValidType(mode uint32) bool {
 	default:
 		return false
 	}
+}
+
+// Sync flushes sentry-owned mapped data before requesting daemon durability.
+func (fs *filesystem) Sync(ctx context.Context) error {
+	fs.inodesMu.Lock()
+	var inodes []*inode
+	for _, i := range fs.inodes {
+		if i.TryIncRef() {
+			inodes = append(inodes, i)
+		}
+	}
+	fs.inodesMu.Unlock()
+	var firstErr error
+	for _, i := range inodes {
+		i.dataMu.Lock()
+		err := i.syncMappedLocked(ctx)
+		if err == nil && i.writeback != nil {
+			in := linux.FUSEFsyncIn{Fh: i.writeback.fh}
+			err = i.call(ctx, linux.FUSE_FSYNC, &in, nil)
+			if linuxerr.Equals(linuxerr.ENOSYS, err) {
+				err = nil
+			}
+		}
+		i.dataMu.Unlock()
+		i.DecRef(ctx)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

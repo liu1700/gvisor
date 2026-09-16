@@ -25,9 +25,12 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -111,7 +114,20 @@ type inode struct {
 
 	// +checklocks:attrMu
 	blockSize atomicbitops.Uint32 // 0 if unknown.
+
+	// Lock order: attrMu -> mapsMu -> dataMu. Translate only takes dataMu;
+	// never hold dataMu while invalidating mappings (which takes MM locks).
+	mapsMu   sync.Mutex `state:"nosave"`
+	mappings memmap.MappingSet
+	dataMu   sync.Mutex `state:"nosave"`
+	cache    fsutil.FileRangeSet
+	dirty    fsutil.DirtySet
+	// writeback owns the daemon handle while mapped pages are dirty.
+	// It does not retain a VFS reference to the inode.
+	writeback *writebackHandle
 }
+
+var _ pgalloc.EvictableMemoryUser = (*inode)(nil)
 
 func (i *inode) Mode() linux.FileMode {
 	i.attrMu.Lock()
@@ -171,7 +187,15 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 
 // DecRef implements kernfs.Inode.DecRef.
 func (i *inode) DecRef(ctx context.Context) {
-	i.inodeRefs.DecRef(func() { i.Destroy(ctx) })
+	i.inodeRefs.DecRef(func() {
+		i.fs.inodesMu.Lock()
+		if i.fs.inodes[i.nodeID] == i {
+			delete(i.fs.inodes, i.nodeID)
+		}
+		i.fs.inodesMu.Unlock()
+		i.destroyCache(ctx)
+		i.OrderedChildren.Destroy(ctx)
+	})
 }
 
 func pidFromContext(ctx context.Context) uint32 {
@@ -225,6 +249,7 @@ func (i *inode) allowCredentials(creds *auth.Credentials) bool {
 // FUSE_LINK and FUSE_LOOKUP.
 func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMode, opcode linux.FUSEOpcode, payload marshal.Marshallable) (kernfs.Inode, error) {
 	out := linux.FUSECreateOut{}
+	attributeVersion := i.fs.conn.attributeVersion.Load()
 	var err error
 	if opcode == linux.FUSE_CREATE {
 		err = i.call(ctx, opcode, payload, &out)
@@ -237,7 +262,7 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}
-	child, err := i.fs.newInode(ctx, out.FUSEEntryOut)
+	child, err := i.fs.newInode(ctx, out.FUSEEntryOut, attributeVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +375,7 @@ func (i *inode) getAttr(ctx context.Context, creds *auth.Credentials, fs *vfs.Fi
 		return i.getFUSEAttr(), nil
 	}
 	i.fs.conn.mu.Unlock()
-	i.updateAttrs(out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
+	i.updateAttrs(ctx, out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
 	return out.Attr, nil
 }
 
@@ -421,15 +446,18 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		GID:       opts.Stat.GID,
 	}
 	var out linux.FUSEAttrOut
+	i.dataMu.Lock()
 	if err := i.call(ctx, linux.FUSE_SETATTR, &in, &out); err != nil {
+		i.dataMu.Unlock()
 		return err
 	}
-	i.updateAttrs(out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
+	i.updateSizeAndUnlockData(ctx, out.Attr.Size)
+	i.updateAttrs(ctx, out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
 	return nil
 }
 
 // +checklocks:i.attrMu
-func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
+func (i *inode) updateAttrs(ctx context.Context, attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
 	i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 	i.fs.conn.mu.Unlock()
@@ -445,7 +473,7 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.mtime.Store(attr.MTimeNsec())
 	i.ctime.Store(attr.CTimeNsec())
 
-	i.size.Store(attr.Size)
+	i.updateSizeMMap(ctx, attr.Size)
 	i.nlink.Store(attr.Nlink)
 
 	if !i.fs.opts.defaultPermissions {
@@ -567,7 +595,14 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		}
 
 		out := linux.FUSEOpenOut{}
-		if err := i.call(ctx, opcode, &in, &out); err != nil {
+		i.dataMu.Lock()
+		openErr := i.call(ctx, opcode, &in, &out)
+		if openErr == nil && truncateRegFile && i.fs.conn.atomicOTrunc {
+			i.updateSizeAndUnlockData(ctx, 0)
+		} else {
+			i.dataMu.Unlock()
+		}
+		if err := openErr; err != nil {
 			if linuxerr.Equals(linuxerr.ENOSYS, err) && !i.filemode().IsDir() {
 				i.fs.conn.noOpen = true
 			} else {
@@ -581,7 +616,6 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 				i.fs.conn.mu.Lock()
 				i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 				i.fs.conn.mu.Unlock()
-				i.size.Store(0)
 				i.touchCMtime()
 			}
 		}
@@ -590,7 +624,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fd.OpenFlag &= ^uint32(linux.FOPEN_DIRECT_IO)
 	}
 
-	// TODO(gvisor.dev/issue/3234): invalidate mmap after implemented it for FUSE Inode
+	if fd.OpenFlag&linux.FOPEN_KEEP_CACHE == 0 && i.filemode().FileType() == linux.S_IFREG {
+		i.invalidateCleanCache(ctx)
+	}
 	fd.DirectIO = fd.OpenFlag&linux.FOPEN_DIRECT_IO != 0
 	fdOptions := &vfs.FileDescriptionOptions{}
 	if fd.OpenFlag&linux.FOPEN_NONSEEKABLE != 0 {

@@ -1247,14 +1247,25 @@ func Init() {
 				info := prevGetInfo()
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE", "NV2080_CTRL_NVLINK_LOCK_REMAP_TABLE_AND_MSE_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY", "NV2080_CTRL_NVLINK_SETUP_NVLE_ENCRYPTION_KEY_PARAMS")
-				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2", "NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = ioctlInfo("NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2", nvgpu.NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS{})
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2", "NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_V2_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3", "NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_V3_PARAMS")
 				return info
 			}
 			return abi
 		})
-		_ = addDriverABI(620, 30, 0, ChecksumNoDriver, "d7f6cad7861c3b4faea8b539af72da98a5a72c60665f4779ca0c6f1e1660856d", v620_06_00)
+		_ = addDriverABI(620, 30, 0, ChecksumNoDriver, "d7f6cad7861c3b4faea8b539af72da98a5a72c60665f4779ca0c6f1e1660856d", func() *driverABI {
+			abi := v620_06_00()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY", "NV2080_CTRL_NVLINK_SET_NVLE_READY_PARAMS")
+				return info
+			}
+			return abi
+		})
 	})
 }
 

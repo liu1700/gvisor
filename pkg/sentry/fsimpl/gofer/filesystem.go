@@ -1084,6 +1084,9 @@ var logRejectedFifoOpenOnce sync.Once
 // Used to log an open of an unimplemented character device, once.
 var logUnimplementedCharDevOpenOnce sync.Once
 
+// Used to log an open of an unimplemented block device, once.
+var logUnimplementedBlockDevOpenOnce sync.Once
+
 // Preconditions: The caller must hold no locks (since opening pipes may block
 // indefinitely).
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
@@ -1091,6 +1094,14 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
+	}
+	if ats.MayWrite() {
+		// Reject writes to a file that is currently being executed, as Linux
+		// does in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This
+		// covers O_TRUNC, which AccessTypesForOpenFlags folds into MayWrite.
+		if err := d.inode.writeCount.CheckWrite(); err != nil {
+			return nil, err
+		}
 	}
 	if !d.inode.isSynthetic() {
 		// renameMu is locked here because it is required by d.openHandle(), which
@@ -1206,6 +1217,20 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			d.inode.fs.renameMu.RLock()
 			return fd, err
 		}
+	case linux.S_IFBLK:
+		// This should be unreachable: block devices are rejected at walk time
+		// by both the gofer (fsgofer checkSupportedFileType) and directfs
+		// (gofer client checkSupportedFileType), and cannot be created via
+		// mknod. Handle the case anyway, for defense in depth: never fall
+		// through to openSpecialFile (host passthrough). The sentry implements
+		// no block devices (nothing registers vfs.BlockDevice), so fail with
+		// ENXIO like the device registry would; this also matches Linux for a
+		// block device with no driver. There is deliberately no passthrough
+		// policy for block devices.
+		logUnimplementedBlockDevOpenOnce.Do(func() {
+			log.Warningf("Opening block device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO.", d.inode.rdevMajor, d.inode.rdevMinor, d.name)
+		})
+		return nil, linuxerr.ENXIO
 	}
 
 	if vfd == nil {
@@ -1436,11 +1461,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if opts.Flags&(linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE) == linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE {
 		return linuxerr.EINVAL
 	}
-	if fs.opts.interop == InteropModeShared && opts.Flags&linux.RENAME_NOREPLACE != 0 {
-		// Requires 9P support to synchronize with other remote filesystem
-		// users.
-		return linuxerr.EINVAL
-	}
+	// For nonzero flags, ClientFD.RenameAt uses the atomic RenameAt2 RPC and
+	// returns EINVAL when the peer does not advertise that operation. Shared
+	// revalidation cannot close an external create race; the atomic backend
+	// operation below does.
 	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
 	newName := rp.Component()

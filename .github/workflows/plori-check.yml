@@ -1,0 +1,32 @@
+name: plori-check
+on:
+  pull_request:
+    branches: [plori/fuse-big-writes]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuse-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CGO_ENABLED: "0"
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install native FUSE test dependencies
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config gcc python3 git sqlite3
+      - name: Check generated state
+        run: tools/plori-stateify.sh --check
+      - name: Build exact source and standard sidecars
+        run: tools/plori-release-build.sh "candidate-${GITHUB_SHA}"
+      - name: Qualify FUSE behavior
+        run: tests/fuse/qualify.sh out/runsc results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuse-compatibility
+          path: results/*.jsonl

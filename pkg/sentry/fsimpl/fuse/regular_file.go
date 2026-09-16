@@ -15,14 +15,14 @@
 package fuse
 
 import (
-	"io"
 	"math"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -39,50 +39,56 @@ type regularFileFD struct {
 	// +checklocks:offMu
 	off int64
 
-	// mapsMu protects mappings.
-	mapsMu sync.Mutex `state:"nosave"`
-
-	// mappings tracks mappings of the file into memmap.MappingSpaces.
-	//
-	// Protected by mapsMu.
-	mappings memmap.MappingSet
-
-	// dataMu protects the fields below.
-	dataMu sync.RWMutex `state:"nosave"`
-
-	// data maps offsets into the file to offsets into memFile that store
-	// the file's data.
-	//
-	// Protected by dataMu.
-	data fsutil.FileRangeSet
+	// Protected by inode.dataMu. A transferred handle outlives VFS Release
+	// until the inode has written its dirty pages.
+	handleTransferred bool
 }
 
-// Seek implements vfs.FileDescriptionImpl.Allocate.
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	if mode & ^uint64(linux.FALLOC_FL_KEEP_SIZE|linux.FALLOC_FL_PUNCH_HOLE|linux.FALLOC_FL_ZERO_RANGE) != 0 {
 		return linuxerr.EOPNOTSUPP
 	}
 	in := linux.FUSEFallocateIn{
 		Fh:     fd.Fh,
-		Offset: uint64(offset),
-		Length: uint64(length),
+		Offset: offset,
+		Length: length,
 		Mode:   uint32(mode),
 	}
 	i := fd.inode()
-	if err := i.call(ctx, linux.FUSE_FALLOCATE, &in, nil); err != nil {
-		return err
-	}
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
-	if uint64(offset+length) > i.size.Load() {
-		if err := i.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
-			return err
-		}
-		// If the offset after update is still too large, return error.
-		if uint64(offset) >= i.size.Load() {
-			return io.EOF
+	i.dataMu.Lock()
+	if err := i.syncMappedLocked(ctx); err != nil {
+		i.dataMu.Unlock()
+		return err
+	}
+	if err := i.call(ctx, linux.FUSE_FALLOCATE, &in, nil); err != nil {
+		i.dataMu.Unlock()
+		return err
+	}
+	if mode&(linux.FALLOC_FL_PUNCH_HOLE|linux.FALLOC_FL_ZERO_RANGE) != 0 {
+		r := memmap.MappableRange{Start: offset, End: offset + length}
+		for seg := i.cache.LowerBoundSegment(r.Start); seg.Ok() && seg.Start() < r.End; seg, _ = seg.NextNonEmpty() {
+			blocks, err := i.fs.mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(r)), hostarch.Write)
+			if err != nil {
+				i.dataMu.Unlock()
+				return err
+			}
+			if _, err := safemem.ZeroSeq(blocks); err != nil {
+				i.dataMu.Unlock()
+				return err
+			}
 		}
 	}
+	size := i.size.Load()
+	if mode&linux.FALLOC_FL_KEEP_SIZE == 0 && offset+length > size {
+		size = offset + length
+	}
+	i.updateSizeAndUnlockData(ctx, size)
+	i.fs.conn.attributeVersion.Add(1)
+	i.touchCMtime()
+
 	return nil
 }
 
@@ -134,62 +140,21 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, linuxerr.EINVAL
 	}
 
-	// TODO(gvisor.dev/issue/3678): Add direct IO support.
-
-	inode := fd.inode()
-	inode.attrMu.Lock()
-	defer inode.attrMu.Unlock()
-
-	// Reading beyond EOF, update file size if outdated.
-	if uint64(offset+size) > inode.size.Load() {
-		if err := inode.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
-			return 0, err
+	i := fd.inode()
+	if !fd.DirectIO {
+		i.attrMu.Lock()
+		if uint64(offset)+uint64(size) > i.size.Load() {
+			if err := i.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
+				i.attrMu.Unlock()
+				return 0, err
+			}
 		}
-		// If the offset after update is still too large, return error.
-		if uint64(offset) >= inode.size.Load() {
-			return 0, io.EOF
-		}
+		i.touchAtime()
+		i.attrMu.Unlock()
 	}
+	rw := fileReadWriter{ctx: ctx, fd: fd, i: i, off: uint64(offset)}
+	return dst.CopyOutFrom(ctx, &rw)
 
-	// Truncate the read with updated file size.
-	fileSize := inode.size.Load()
-	if uint64(offset+size) > fileSize {
-		size = int64(fileSize) - offset
-	}
-
-	buffers, n, err := inode.fs.ReadInPages(ctx, fd, uint64(offset), uint32(size))
-	if err != nil {
-		return 0, err
-	}
-
-	// TODO(gvisor.dev/issue/3237): support indirect IO (e.g. caching),
-	// store the bytes that were read ahead.
-
-	// Update the number of bytes to copy for short read.
-	if n < uint32(size) {
-		size = int64(n)
-	}
-
-	// Copy the bytes read to the dst.
-	// This loop is intended for fragmented reads.
-	// For the majority of reads, this loop only execute once.
-	var copied int64
-	for _, buffer := range buffers {
-		toCopy := int64(len(buffer))
-		if copied+toCopy > size {
-			toCopy = size - copied
-		}
-		cp, err := dst.DropFirst64(copied).CopyOut(ctx, buffer[:toCopy])
-		if err != nil {
-			return 0, err
-		}
-		if int64(cp) != toCopy {
-			return 0, linuxerr.EIO
-		}
-		copied += toCopy
-	}
-
-	return copied, nil
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -263,26 +228,48 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, offset, nil
 	}
 	src = src.TakeFirst64(limit)
-
-	n, offset, err := inode.fs.Write(ctx, fd, offset, src)
-	if n == 0 {
-		// We have checked srclen != 0 previously.
-		if err != nil {
-			return 0, offset, err
-		}
-		// If err == nil, then it's a short write and we return EIO.
-		return 0, offset, linuxerr.EIO
-	}
-
-	if offset > int64(inode.size.Load()) {
-		inode.size.Store(uint64(offset))
+	rw := fileReadWriter{ctx: ctx, fd: fd, i: inode, off: uint64(offset)}
+	n, err := src.CopyInTo(ctx, &rw)
+	offset = int64(rw.off)
+	if n != 0 {
 		inode.fs.conn.attributeVersion.Add(1)
 	}
+
 	inode.touchCMtime()
 	return n, offset, err
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	return linuxerr.ENOSYS
+	if fd.DirectIO && !opts.Private {
+		return linuxerr.ENODEV
+	}
+	opts.SentryOwnedContent = true
+	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+}
+
+func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.mmapAddMapping(ctx, ms, ar, offset, writable)
+}
+func (fd *regularFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mmapRemoveMapping(ctx, ms, ar, offset, writable)
+}
+func (fd *regularFileFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.mmapCopyMapping(ctx, ms, srcAR, dstAR, offset, writable)
+}
+func (fd *regularFileFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	return fd.mmapTranslate(ctx, required, optional, at)
+}
+
+// All translations use the sentry memory file, whose pages are saved along
+// with the inode cache and the FUSE connection. No daemon I/O is needed while
+// application tasks are stopped for checkpointing.
+func (fd *regularFileFD) InvalidateUnsavable(context.Context) error { return nil }
+
+// Sync writes shared mapped pages before asking the daemon to sync the file.
+func (fd *regularFileFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
+	if err := fd.inode().syncMapped(ctx, fd); err != nil {
+		return err
+	}
+	return fd.fileDescription.Sync(ctx, opts)
 }

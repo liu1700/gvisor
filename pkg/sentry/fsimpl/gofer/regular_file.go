@@ -100,6 +100,10 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	// Nonzero modes need cache and size semantics that this implementation does not yet provide.
+	if mode != 0 {
+		return linuxerr.EOPNOTSUPP
+	}
 	d := fd.dentry()
 	return d.doAllocate(ctx, offset, length, func() error {
 		return d.inode.allocate(ctx, mode, offset, length)

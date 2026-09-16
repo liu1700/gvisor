@@ -98,6 +98,18 @@ func (fd *DeviceFD) connected() bool {
 	return false
 }
 
+// connectionError distinguishes an unused device from a disconnected daemon.
+// +checklocks:fd.mu
+func (fd *DeviceFD) connectionError() error {
+	if fd.conn == nil {
+		return linuxerr.EPERM
+	}
+	if !fd.connected() {
+		return linuxerr.ENODEV
+	}
+	return nil
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	// Operations on /dev/fuse don't make sense until a FUSE filesystem is
@@ -105,8 +117,8 @@ func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset in
 	// filesystem mounted.
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return 0, linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return 0, err
 	}
 
 	return 0, linuxerr.ENOSYS
@@ -116,8 +128,8 @@ func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset in
 func (fd *DeviceFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return 0, linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return 0, err
 	}
 	return fd.conn.read(ctx, dst)
 }
@@ -129,8 +141,8 @@ func (fd *DeviceFD) PWrite(ctx context.Context, src usermem.IOSequence, offset i
 	// filesystem mounted.
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return 0, linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return 0, err
 	}
 
 	return 0, linuxerr.ENOSYS
@@ -140,8 +152,8 @@ func (fd *DeviceFD) PWrite(ctx context.Context, src usermem.IOSequence, offset i
 func (fd *DeviceFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return 0, linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return 0, err
 	}
 	return fd.conn.write(ctx, src)
 }
@@ -163,8 +175,8 @@ func (fd *DeviceFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 func (fd *DeviceFD) EventRegister(e *waiter.Entry) error {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return err
 	}
 	fd.conn.waitQueue.EventRegister(e)
 	return nil
@@ -174,10 +186,9 @@ func (fd *DeviceFD) EventRegister(e *waiter.Entry) error {
 func (fd *DeviceFD) EventUnregister(e *waiter.Entry) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return
+	if fd.conn != nil {
+		fd.conn.waitQueue.EventUnregister(e)
 	}
-	fd.conn.waitQueue.EventUnregister(e)
 }
 
 // Epollable implements FileDescriptionImpl.Epollable.
@@ -192,8 +203,8 @@ func (fd *DeviceFD) Seek(ctx context.Context, offset int64, whence int32) (int64
 	// filesystem mounted.
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
-		return 0, linuxerr.EPERM
+	if err := fd.connectionError(); err != nil {
+		return 0, err
 	}
 
 	return 0, linuxerr.ENOSYS

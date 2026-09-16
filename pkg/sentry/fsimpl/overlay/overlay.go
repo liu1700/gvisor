@@ -656,6 +656,15 @@ type dentry struct {
 
 	locks vfs.FileLocks
 
+	// writeCount tracks write access to the file represented by this dentry,
+	// and is used to prevent a file from being written while it is being
+	// executed. See vfs.WriteCount.
+	//
+	// Note that, as with watches below, hard links to the same file do not
+	// share a writeCount, because this overlay implementation has no inode
+	// structures.
+	writeCount vfs.WriteCount
+
 	// watches is the set of inotify watches on the file represented by this dentry.
 	//
 	// Note that hard links to the same file will not share the same set of
@@ -886,6 +895,11 @@ func (d *dentry) topLookupLayer() lookupLayer {
 	return lookupLayerLower
 }
 
+// WriteCount implements vfs.WriteCounter.WriteCount.
+func (d *dentry) WriteCount() *vfs.WriteCount {
+	return &d.writeCount
+}
+
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
 }
@@ -922,6 +936,7 @@ func (d *dentry) statInternalTo(ctx context.Context, opts *vfs.StatOptions, stat
 }
 
 // Preconditions: d.copyMu must be locked for writing.
+// +checklocks:d.copyMu
 func (d *dentry) updateAfterSetStatLocked(opts *vfs.SetStatOptions) {
 	if opts.Stat.Mask&linux.STATX_MODE != 0 {
 		// If the mode was changed, the underlying file's ACL may have changed,

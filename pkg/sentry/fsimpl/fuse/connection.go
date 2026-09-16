@@ -69,7 +69,37 @@ func (dc *deviceConn) call(ctx context.Context, r *Request) (*Response, error) {
 	return res, nil
 }
 
-func (dc *deviceConn) release(ctx context.Context) {}
+func (dc *deviceConn) release(ctx context.Context) {
+	dc.conn.mu.Lock()
+	if dc.conn.mounts == 0 {
+		dc.conn.mu.Unlock()
+		panic("FUSE device connection released without a mount")
+	}
+	dc.conn.mounts--
+	last := dc.conn.mounts == 0 && dc.conn.connected
+	if last {
+		// Publish disconnection before another mount can inspect this
+		// connection. A concurrent mount will create a new connection instead
+		// of being added immediately before this one is aborted.
+		dc.conn.connected = false
+	}
+	dc.conn.mu.Unlock()
+	if last {
+		dc.conn.abort(ctx, true /* alreadyDisconnected */)
+	}
+}
+
+// addMount atomically reserves a mount while the connection remains live.
+func (dc *deviceConn) addMount() bool {
+	dc.conn.mu.Lock()
+	if !dc.conn.connected {
+		dc.conn.mu.Unlock()
+		return false
+	}
+	dc.conn.mounts++
+	dc.conn.mu.Unlock()
+	return true
+}
 
 // connection is the struct by which the sentry communicates with the FUSE server daemon.
 //
@@ -160,6 +190,10 @@ type connection struct {
 	//
 	// +checklocks:mu
 	connected bool
+
+	// mounts is the number of in-sandbox filesystems using this connection.
+	// Protected by mu. The DeviceFD itself owns the initial connection ref.
+	mounts uint64
 
 	// connInitError if FUSE_INIT encountered error (major version mismatch).
 	// Only set in INIT.
