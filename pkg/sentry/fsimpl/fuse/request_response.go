@@ -161,13 +161,21 @@ func newFutureResponse(req *Request) *futureResponse {
 
 // resolve blocks the task until the server responds to its corresponding request,
 // then returns a resolved response.
+//
+// The wait is killable, matching Linux's fs/fuse/dev.c:request_wait_answer()
+// for a connection that does not use FUSE_INTERRUPT. Once a request has been
+// handed to the server it cannot be taken back, so an ordinary signal must not
+// abandon it: doing so would fail the calling syscall with EINTR from
+// operations that Linux never fails that way, such as unlink(2) or close(2)
+// under a periodic timer. The signal stays pending and is delivered when the
+// syscall returns.
 func (f *futureResponse) resolve(b context.Blocker) (*Response, error) {
 	// Return directly for async requests.
 	if f.async {
 		return nil, nil
 	}
 
-	if err := b.Block(f.ch); err != nil {
+	if err := b.BlockKillable(f.ch); err != nil {
 		return nil, err
 	}
 

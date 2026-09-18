@@ -146,6 +146,56 @@ func (t *Task) Block(C <-chan struct{}) error {
 	return t.block(C, nil)
 }
 
+// BlockKillable implements context.Context.BlockKillable.
+//
+// BlockKillable blocks until an event is received from C, or until t must
+// return to the task run loop for a reason that cannot be deferred: t has a
+// fatal signal pending, or a stop is pending. An ordinary interrupt - most
+// often the delivery of a signal that the application handles or ignores -
+// does not end the wait. Such an interrupt is consumed here and re-armed
+// before BlockKillable returns, so it is still processed on the way out of the
+// syscall; the syscall itself does not fail with EINTR.
+//
+// BlockKillable is the sentry analogue of Linux's wait_event_killable(), which
+// fs/fuse/dev.c:request_wait_answer() uses so that a signal arriving while a
+// filesystem operation is in flight does not make that operation fail. Use it
+// in place of Block when the operation being waited on cannot be redone once
+// it has started.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) BlockKillable(C <-chan struct{}) error {
+	consumed := false
+	for {
+		err := t.block(C, nil)
+		if err == nil {
+			if consumed {
+				// Re-arm the interrupt consumed below so that Task.interrupted
+				// still reports it to the task run loop.
+				t.interruptSelf()
+			}
+			return nil
+		}
+		// t.block re-armed the interrupt before returning, so returning here
+		// leaves the interrupt state exactly as Block would have left it.
+		if t.killed() || t.stopCount.Load() > 0 {
+			return err
+		}
+		// An ordinary interrupt. Consume it, because t.block would otherwise
+		// return immediately on every subsequent call; it is re-armed before
+		// BlockKillable returns.
+		t.unsetInterrupted()
+		consumed = true
+		// An interrupter sets its state (a pending signal, a stop) before it
+		// arms the interrupt, and arming is a no-op when the interrupt is
+		// already armed. Re-check after consuming so that an interrupt dropped
+		// that way is not lost.
+		if t.killed() || t.stopCount.Load() > 0 {
+			t.interruptSelf()
+			return linuxerr.ErrInterrupted
+		}
+	}
+}
+
 // BlockOn implements context.Context.BlockOn.
 //
 // Preconditions: The caller must be running on the task goroutine.
