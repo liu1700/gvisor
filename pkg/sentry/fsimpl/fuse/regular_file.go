@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -236,6 +237,13 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 
 	inode.touchCMtime()
+
+	// As on Linux, writing clears the setuid and setgid bits.
+	if n > 0 {
+		if sidErr := inode.clearSUIDAndSGID(ctx, auth.CredentialsFromContext(ctx), fhOptions{useFh: true, fh: fd.Fh}); sidErr != nil && err == nil {
+			return n, offset, sidErr
+		}
+	}
 	return n, offset, err
 }
 

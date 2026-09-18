@@ -773,6 +773,17 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
+	// A directory may not be renamed into itself or into its own subtree:
+	// the result would be detached from the tree. Linux makes this check in
+	// the VFS, before the filesystem sees the rename — do_renameat2()
+	// (fs/namei.c) compares the source against the trap returned by
+	// lock_rename() and returns EINVAL. tmpfs and overlayfs make the same
+	// check here. Without it the request reaches the filesystem, which
+	// reports the failure with an errno of its own choosing.
+	if src.isDir() && (src == dstDir || genericIsAncestorDentry(fs, src, dstDir)) {
+		return linuxerr.EINVAL
+	}
+
 	// Can we create the dst dentry?
 	var dst *Dentry
 	newName := rp.Component()
