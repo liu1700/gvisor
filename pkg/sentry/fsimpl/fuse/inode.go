@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -84,6 +85,14 @@ type inode struct {
 
 	locks   vfs.FileLocks
 	watches vfs.Watches
+
+	// pipeMu protects pipe.
+	pipeMu sync.Mutex `state:"nosave"`
+
+	// pipe is the pipe backing this inode if it is a FIFO, created on the
+	// first open. It is sentry state, not filesystem state.
+	// +checklocks:pipeMu
+	pipe *pipe.VFSPipe `state:"nosave"`
 
 	// attrMu protects the attributes of this inode.
 	attrMu sync.Mutex `state:"nosave"`
@@ -303,53 +312,43 @@ func (i *inode) getFUSEAttr() linux.FUSEAttr {
 }
 
 // statFromFUSEAttr makes attributes from linux.FUSEAttr to linux.Statx.
-func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
+// statFromFUSEAttr converts a FUSE attribute reply to a Statx.
+//
+// Like gofer and tmpfs, and like Linux, it fills every basic field and reports
+// them all in Mask regardless of what the caller asked for: statx(2) may
+// return more than was requested, and a caller that reads Mask (copy_file_range
+// checks STATX_TYPE, for one) must not be told the fields are absent.
+func statFromFUSEAttr(attr linux.FUSEAttr, devMinor uint32) linux.Statx {
 	var stat linux.Statx
+	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK |
+		linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME |
+		linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_INO |
+		linux.STATX_SIZE | linux.STATX_BLOCKS
 	stat.Blksize = attr.BlkSize
 	stat.DevMajor, stat.DevMinor = linux.UNNAMED_MAJOR, devMinor
 
 	rdevMajor, rdevMinor := linux.DecodeDeviceID(attr.Rdev)
 	stat.RdevMajor, stat.RdevMinor = uint32(rdevMajor), rdevMinor
 
-	if mask&linux.STATX_MODE != 0 {
-		stat.Mode = uint16(attr.Mode)
+	stat.Mode = uint16(attr.Mode)
+	stat.Nlink = attr.Nlink
+	stat.UID = attr.UID
+	stat.GID = attr.GID
+	stat.Atime = linux.StatxTimestamp{
+		Sec:  int64(attr.Atime),
+		Nsec: attr.AtimeNsec,
 	}
-	if mask&linux.STATX_NLINK != 0 {
-		stat.Nlink = attr.Nlink
+	stat.Mtime = linux.StatxTimestamp{
+		Sec:  int64(attr.Mtime),
+		Nsec: attr.MtimeNsec,
 	}
-	if mask&linux.STATX_UID != 0 {
-		stat.UID = attr.UID
+	stat.Ctime = linux.StatxTimestamp{
+		Sec:  int64(attr.Ctime),
+		Nsec: attr.CtimeNsec,
 	}
-	if mask&linux.STATX_GID != 0 {
-		stat.GID = attr.GID
-	}
-	if mask&linux.STATX_ATIME != 0 {
-		stat.Atime = linux.StatxTimestamp{
-			Sec:  int64(attr.Atime),
-			Nsec: attr.AtimeNsec,
-		}
-	}
-	if mask&linux.STATX_MTIME != 0 {
-		stat.Mtime = linux.StatxTimestamp{
-			Sec:  int64(attr.Mtime),
-			Nsec: attr.MtimeNsec,
-		}
-	}
-	if mask&linux.STATX_CTIME != 0 {
-		stat.Ctime = linux.StatxTimestamp{
-			Sec:  int64(attr.Ctime),
-			Nsec: attr.CtimeNsec,
-		}
-	}
-	if mask&linux.STATX_INO != 0 {
-		stat.Ino = attr.Ino
-	}
-	if mask&linux.STATX_SIZE != 0 {
-		stat.Size = attr.Size
-	}
-	if mask&linux.STATX_BLOCKS != 0 {
-		stat.Blocks = attr.Blocks
-	}
+	stat.Ino = attr.Ino
+	stat.Size = attr.Size
+	stat.Blocks = attr.Blocks
 	return stat
 }
 
@@ -456,6 +455,30 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	return nil
 }
 
+// clearSUIDAndSGID clears the setuid and setgid bits after a write, and
+// propagates the new mode to the server so that it survives the attribute
+// cache and a remount.
+//
+// Linux does this in the kernel, not in the FUSE server: fuse_cache_write_iter()
+// and fuse_direct_write_iter() (fs/fuse/file.c) call file_remove_privs()
+// (fs/inode.c), which turns into a setattr carrying the new mode. Only when a
+// server negotiates FUSE_HANDLE_KILLPRIV_V2 does the kernel hand the job over,
+// and this client does not negotiate it.
+//
+// +checklocks:i.attrMu
+func (i *inode) clearSUIDAndSGID(ctx context.Context, creds *auth.Credentials, fhOpts fhOptions) error {
+	oldMode := i.mode.Load()
+	newMode := vfs.ClearSUIDAndSGID(oldMode)
+	if newMode == oldMode {
+		return nil
+	}
+	opts := vfs.SetStatOptions{Stat: linux.Statx{
+		Mask: linux.STATX_MODE,
+		Mode: uint16(newMode & 07777),
+	}}
+	return i.setAttr(ctx, i.fs.VFSFilesystem(), creds, opts, fhOpts)
+}
+
 // +checklocks:i.attrMu
 func (i *inode) updateAttrs(ctx context.Context, attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
@@ -521,16 +544,89 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	return nil
 }
 
+// checkLargeFileOpen reports whether an open of a file of the given size with
+// the given flags must fail with EOVERFLOW.
+//
+// This is Linux's generic_file_open() (fs/open.c): a file larger than
+// MAX_NON_LFS may only be opened with O_LARGEFILE. On a 64-bit task Linux sets
+// O_LARGEFILE on every open itself (force_o_largefile(), applied by
+// do_sys_openat2() in fs/open.c), so the check never fires there; gVisor does
+// the same in syscalls/linux.openat().
+func checkLargeFileOpen(flags uint32, size uint64) error {
+	if flags&linux.O_LARGEFILE == 0 && size > linux.MAX_NON_LFS {
+		return linuxerr.EOVERFLOW
+	}
+	return nil
+}
+
+// openSpecialFile opens a FIFO or a socket. Linux never sends FUSE_OPEN for
+// these: fuse_init_inode() (fs/fuse/inode.c) hands them to init_special_inode()
+// (fs/inode.c), which gives a FIFO the kernel's own pipefifo_fops and leaves a
+// socket with no_open_fops, whose open returns ENXIO. A socket is reached
+// through connect(2), not open(2).
+//
+// It returns a nil FileDescription and a nil error if ft is not a type this
+// handles, so the caller falls through to the FUSE_OPEN path.
+func (i *inode) openSpecialFile(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error, bool) {
+	ft := i.filemode().FileType()
+	if handled, err := openSpecialFileType(ft); !handled {
+		return nil, nil, false
+	} else if err != nil {
+		return nil, err, true
+	}
+	switch ft {
+	case linux.S_IFIFO:
+		// The pipe is per-inode and lives in the sentry; its contents never
+		// reach the FUSE server, only the inode does.
+		fd, err := i.namedPipe().Open(ctx, rp.Mount(), d.VFSDentry(), opts.Flags, &i.locks)
+		return fd, err, true
+	}
+	panic("openSpecialFileType claimed a file type openSpecialFile does not open")
+}
+
+// openSpecialFileType reports whether open(2) of a file of this type is served
+// by the sentry instead of by a FUSE_OPEN request, and the error to fail the
+// open with when the type cannot be opened at all.
+func openSpecialFileType(ft linux.FileMode) (handled bool, err error) {
+	switch ft {
+	case linux.S_IFIFO:
+		return true, nil
+	case linux.S_IFSOCK:
+		return true, linuxerr.ENXIO
+	}
+	return false, nil
+}
+
+// namedPipe returns the pipe backing this FIFO inode, creating it on first
+// use. All openers of the inode share it, as they share Linux's.
+func (i *inode) namedPipe() *pipe.VFSPipe {
+	i.pipeMu.Lock()
+	defer i.pipeMu.Unlock()
+	if i.pipe == nil {
+		i.pipe = pipe.NewVFSPipe(true /* isNamed */, pipe.DefaultPipeSize)
+	}
+	return i.pipe
+}
+
 // Open implements kernfs.Inode.Open.
 func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	// Handle FIFOs and sockets before taking attrMu: opening a FIFO blocks
+	// until a peer arrives.
+	if fd, err, handled := i.openSpecialFile(ctx, rp, d, opts); handled {
+		return fd, err
+	}
+
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	// Check O_LARGEFILE before the mask below drops it. Masking first made
+	// the check unconditionally true, so every open of a file larger than
+	// 2 GiB failed with EOVERFLOW.
+	if err := checkLargeFileOpen(opts.Flags, i.size.Load()); err != nil {
+		return nil, err
+	}
 	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
 		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY |
 		linux.O_APPEND | linux.O_DIRECT
-	i.attrMu.Lock()
-	defer i.attrMu.Unlock()
-	if opts.Flags&linux.O_LARGEFILE == 0 && i.size.Load() > linux.MAX_NON_LFS {
-		return nil, linuxerr.EOVERFLOW
-	}
 
 	var (
 		fd     *fileDescription
@@ -851,9 +947,9 @@ func (i *inode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptio
 		if err != nil {
 			return linux.Statx{}, err
 		}
-		return statFromFUSEAttr(attr, opts.Mask, i.fs.devMinor), nil
+		return statFromFUSEAttr(attr, i.fs.devMinor), nil
 	}
-	return statFromFUSEAttr(i.getFUSEAttr(), opts.Mask, i.fs.devMinor), nil
+	return statFromFUSEAttr(i.getFUSEAttr(), i.fs.devMinor), nil
 }
 
 // StatFS implements kernfs.Inode.StatFS.
@@ -882,6 +978,20 @@ func (i *inode) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, e
 	}, nil
 }
 
+// checkSetStatType rejects a size change that the file type does not allow.
+//
+// Linux rejects a truncate of a directory before it reaches the filesystem:
+// do_sys_truncate() (fs/open.c) returns EISDIR for a directory and EINVAL for
+// any other non-regular file. Without this the request reaches the server,
+// which answers with whatever errno it uses for an unsupported truncate.
+// kernfs, gofer and tmpfs all make the same check.
+func checkSetStatType(mask uint32, mode linux.FileMode) error {
+	if mask&linux.STATX_SIZE != 0 && mode.IsDir() {
+		return linuxerr.EISDIR
+	}
+	return nil
+}
+
 // SetStat implements kernfs.Inode.SetStat.
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	if !i.allowCredentials(creds) {
@@ -890,6 +1000,9 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
+	if err := checkSetStatType(opts.Stat.Mask, i.filemode()); err != nil {
+		return err
+	}
 	if err := vfs.CheckSetStat(ctx, creds, &opts, i.filemode(), nil, auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
 		return err
 	}
