@@ -153,8 +153,10 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 // response is received. It mirrors connection.Call but dispatches through the
 // host I/O path.
 func (hc *hostConnection) Call(ctx context.Context, r *Request) (*Response, error) {
+	// The wait is killable so that an ordinary signal does not fail the
+	// operation; see futureResponse.resolve.
 	if !hc.conn.isInitialized() && r.hdr.Opcode != linux.FUSE_INIT {
-		if err := ctx.Block(hc.conn.initializedChan); err != nil {
+		if err := ctx.BlockKillable(hc.conn.initializedChan); err != nil {
 			return nil, linuxError(err)
 		}
 	}

@@ -431,9 +431,11 @@ func (conn *connection) CallAsync(ctx context.Context, r *Request) error {
 // The forget request does not have a reply,
 // as documented in include/uapi/linux/fuse.h:FUSE_FORGET.
 func (conn *connection) Call(ctx context.Context, r *Request) (*Response, error) {
-	// Block requests sent before connection is initialized.
+	// Block requests sent before connection is initialized. The wait is
+	// killable so that an ordinary signal does not fail the operation; see
+	// futureResponse.resolve.
 	if !conn.isInitialized() && r.hdr.Opcode != linux.FUSE_INIT {
-		if err := ctx.Block(conn.initializedChan); err != nil {
+		if err := ctx.BlockKillable(conn.initializedChan); err != nil {
 			return nil, linuxError(err)
 		}
 	}
@@ -475,7 +477,9 @@ func (conn *connection) callFuture(b context.Blocker, r *Request) (*futureRespon
 		log.Infof("Blocking request %v from being queued. Too many active requests: %v",
 			r.id, conn.numActiveRequests)
 		conn.mu.Unlock()
-		err := b.Block(conn.fullQueueCh)
+		// Killable, as in Linux's fs/fuse/dev.c:fuse_get_req(), which waits
+		// for a free request slot in TASK_KILLABLE.
+		err := b.BlockKillable(conn.fullQueueCh)
 		conn.mu.Lock()
 		if err != nil {
 			return nil, err

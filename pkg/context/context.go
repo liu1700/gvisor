@@ -58,6 +58,19 @@ type Blocker interface {
 	// is interrupted.
 	Block(C <-chan struct{}) error
 
+	// BlockKillable blocks until an event is received from C, or until the
+	// wait must end for a reason that cannot be deferred: a fatal signal, or a
+	// pending stop. Unlike Block, an ordinary interrupt - the delivery of a
+	// signal that the application handles or ignores - does not end the wait.
+	// The interrupt stays pending and is processed when the calling syscall
+	// returns, so the syscall does not fail with EINTR.
+	//
+	// BlockKillable is the analogue of Linux's wait_event_killable(). A caller
+	// waiting on an operation that cannot be redone once it has started, such
+	// as a FUSE request already handed to the server, must use BlockKillable
+	// rather than Block.
+	BlockKillable(C <-chan struct{}) error
+
 	// BlockWithTimeout blocks until an event is received from C, the timeout
 	// has elapsed (only if haveTimeout is true), or some external interrupt.
 	//
@@ -120,6 +133,15 @@ func (nt *NoTask) Block(C <-chan struct{}) error {
 	case <-C:
 		return nil
 	}
+}
+
+// BlockKillable implements Blocker.BlockKillable.
+//
+// A NoTask has no signal state. Its only interrupt source is Interrupt, which
+// is a deliberate cancellation and so is always fatal, making BlockKillable
+// equivalent to Block.
+func (nt *NoTask) BlockKillable(C <-chan struct{}) error {
+	return nt.Block(C)
 }
 
 // BlockOn implements Blocker.BlockOn.
